@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pedestal_subtract"
+version = "0.1.0"
+description = "Pedestal subtraction and double-Gaussian zero/one-electron peak fitting for FITS detector data"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Abby Chriss"},
+]
+keywords = ["physics", "detector", "FITS", "pedestal", "gaussian", "analysis"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+dependencies = [
+    "numpy>=1.19.0",
+    "matplotlib>=3.3.0",
+    "scipy>=1.5.0",
+    "astropy>=4.0",
+    "tqdm>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+]
+
+[project.scripts]
+pedestal-subtract = "pedestal_subtract.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pedestal_subtract*"]
