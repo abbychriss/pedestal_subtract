@@ -71,6 +71,17 @@ def _config_default(config, key, fallback):
     return config[key] if key in config else fallback
 
 
+def _window_scale(value):
+    """argparse type for the fit-window scale factors: a float >= 1.0.
+
+    Values below 1 shrink the window inside the one-electron peak, which leaves
+    the fit nothing to fit, so they are rejected up front."""
+    f = float(value)
+    if f < 1.0:
+        raise argparse.ArgumentTypeError(f"must be >= 1.0 (got {f})")
+    return f
+
+
 # Args that should NOT influence the run-identity hash: anything that only
 # affects display/output (not the pedestal-subtracted data or the fit results).
 _RUN_HASH_EXCLUDE = {
@@ -211,6 +222,16 @@ def init_argparse(argv=None):
     parser.add_argument("--no-use_biweight_midvar", dest="use_biweight_midvar", action="store_false",
                         help="Use std dev for the per-line scale.")
 
+    # ----- Fit window -----
+    parser.add_argument("--zero_one_window_left_scale", type=_window_scale,
+                        default=_config_default(config, 'zero_one_window_left_scale', 1.0),
+                        help="Scale the left half-width of the auto-computed zero/one fit "
+                             "window (>=1.0; >1 widens toward lower charge). Default 1.0.")
+    parser.add_argument("--zero_one_window_right_scale", type=_window_scale,
+                        default=_config_default(config, 'zero_one_window_right_scale', 1.0),
+                        help="Scale the right half-width of the auto-computed zero/one fit "
+                             "window (>=1.0; >1 widens past the one-electron peak). Default 1.0.")
+
     # ----- Plotting -----
     parser.add_argument("-z", "--plot_zero_one_adu", action="store_true",
                         default=_config_default(config, 'plot_zero_one_adu', True),
@@ -313,6 +334,12 @@ def init_argparse(argv=None):
     if args.plot_zero_one_ylim_electrons is None:
         args.plot_zero_one_ylim_electrons = _config_default(config, 'plot_zero_one_ylim_electrons', 'default')
 
+    # argparse's `type` validates CLI strings but not config-supplied defaults, so
+    # re-check the window scales here to also reject values < 1 coming from the JSON.
+    for _scale_arg in ('zero_one_window_left_scale', 'zero_one_window_right_scale'):
+        if getattr(args, _scale_arg) < 1.0:
+            parser.error(f"{_scale_arg} must be >= 1.0 (got {getattr(args, _scale_arg)})")
+
     return args
 
 
@@ -346,6 +373,8 @@ def main(argv=None):
         'n': 100,
         'fit_bounds': 'default',
         'zero_one_test_range': 'auto',
+        'window_left_scale': args.zero_one_window_left_scale,
+        'window_right_scale': args.zero_one_window_right_scale,
     }
 
     run_hash = _run_hash(args)
@@ -409,6 +438,8 @@ def main(argv=None):
         n=fit_params['n'],
         fit_bounds=fit_params['fit_bounds'],
         zero_one_test_range=fit_params['zero_one_test_range'],
+        window_left_scale=fit_params['window_left_scale'],
+        window_right_scale=fit_params['window_right_scale'],
     )
 
     for ext, (pedestal, gain) in enumerate(zip(pedestals, gains)):

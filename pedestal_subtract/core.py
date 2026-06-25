@@ -47,12 +47,24 @@ def _smooth_counts(counts, window=5):
     kernel = np.ones(window) / window
     return np.convolve(counts, kernel, mode='same')
 
+# Bins-per-ADU used only for the internal peak-finding histograms (locating the
+# zero/one peaks and estimating their widths). These need fine resolution and are
+# kept independent of the user-facing `n` (which sets the fit-window bin count),
+# so lowering `n` does not degrade peak detection.
+_PEAKFIND_DENSITY = 100
+
+def _peakfind_bins(hist_range):
+    left, right = hist_range
+    return min(4000, max(50, int(_PEAKFIND_DENSITY * (right - left))))
+
 def _make_histogram(data, hist_range, n, max_bins=4000):
     left, right = hist_range
     if not np.isfinite(left) or not np.isfinite(right) or right <= left:
         raise ValueError(f'Invalid histogram range: {hist_range}')
 
-    nbins = min(max_bins, max(50, int(n * (right - left))))
+    # `n` is the desired number of bins spanning this range (not a per-ADU
+    # density), so the fit window gets ~n bins regardless of its width in ADU.
+    nbins = min(max_bins, max(10, int(n)))
     data_window = data[(data > left) & (data < right)]
     counts, edges = np.histogram(data_window, bins=nbins, range=(left, right))
     centers = 0.5 * (edges[:-1] + edges[1:])
@@ -61,6 +73,28 @@ def _make_histogram(data, hist_range, n, max_bins=4000):
         raise ValueError(f'Could not make a useful histogram for range {hist_range}')
 
     return data_window, counts, edges, centers
+
+def _bar_heights(counts, yscale):
+    """Bar heights for plotting.
+
+    On a log y-axis, zero-count bins are set to NaN so matplotlib draws nothing
+    there -- the bins are genuinely empty rather than clamped up to 1, which
+    previously produced a solid rectangular block along the bottom of images
+    dominated by empty (zero-electron) bins.
+    """
+    counts = np.asarray(counts, dtype=float)
+    if yscale == 'log':
+        heights = counts.copy()
+        heights[heights <= 0] = np.nan
+        return heights
+    return counts
+
+def _fit_curve_x(lo, hi, n_bins, points_per_bin=20, floor=500):
+    """x-grid for drawing the fitted curve, sampled at `points_per_bin` points per
+    histogram bin so the curve stays smooth when zoomed in -- the point density
+    per unit charge is constant regardless of how wide the window is scaled."""
+    n = max(floor, int(points_per_bin) * int(n_bins))
+    return np.linspace(lo, hi, n)
 
 def _estimate_peak_width(centers, counts, peak_index):
     smooth_counts = _smooth_counts(counts)
@@ -91,7 +125,7 @@ def _clip_to_bounds(values, bounds):
     eps = np.maximum(1e-12, 1e-9 * np.maximum(1, np.abs(high - low)))
     return np.minimum(np.maximum(values, low + eps), high - eps)
 
-def _auto_zero_one_setup(data, zero_one_test_range, n):
+def _auto_zero_one_setup(data, zero_one_test_range, n, window_left_scale=1.0, window_right_scale=1.0):
     use_auto_range = (
         zero_one_test_range is None
         or (isinstance(zero_one_test_range, str) and zero_one_test_range in ('auto', 'default'))
@@ -119,7 +153,8 @@ def _auto_zero_one_setup(data, zero_one_test_range, n):
     else:
         range_left, range_right = zero_one_test_range
 
-    _, counts_test, edges_test, centers_test = _make_histogram(data, (range_left, range_right), n)
+    test_range = (range_left, range_right)
+    _, counts_test, edges_test, centers_test = _make_histogram(data, test_range, _peakfind_bins(test_range))
 
     if max(counts_test) == 0:
         raise ValueError(
@@ -144,7 +179,8 @@ def _auto_zero_one_setup(data, zero_one_test_range, n):
     if search_right <= zero_peak_charge:
         search_right = zero_peak_charge + 20 * zero_peak_width
 
-    _, search_counts, search_edges, search_centers = _make_histogram(data, (search_left, search_right), n)
+    search_range = (search_left, search_right)
+    _, search_counts, search_edges, search_centers = _make_histogram(data, search_range, _peakfind_bins(search_range))
     smooth_search = _smooth_counts(search_counts, window=9)
     search_bin_width = search_centers[1] - search_centers[0]
     peak_distance = max(1, int(2 * zero_peak_width / search_bin_width))
@@ -173,11 +209,19 @@ def _auto_zero_one_setup(data, zero_one_test_range, n):
 
     gain_guess = max(one_peak_charge - zero_peak_charge, 4 * zero_peak_width)
 
-    zero_one_left = zero_peak_charge - max(4 * zero_peak_width, 0.5 * gain_guess)
-    zero_one_right = zero_peak_charge + max(1.8 * gain_guess, 8 * zero_peak_width)
+    left_halfwidth = max(4 * zero_peak_width, 0.5 * gain_guess)
+    right_halfwidth = max(1.8 * gain_guess, 8 * zero_peak_width)
+    zero_one_left = zero_peak_charge - window_left_scale * left_halfwidth
+    zero_one_right = zero_peak_charge + window_right_scale * right_halfwidth
     zero_one_range = [zero_one_left, zero_one_right]
 
-    _, zero_one_counts, zero_one_edges, zero_one_centers = _make_histogram(data, zero_one_range, n, max_bins=2000)
+    # Scale the bin count with the (possibly widened) window so the bin width --
+    # the ratio of bins to charge range -- stays the same as at scale 1.0.
+    base_width = left_halfwidth + right_halfwidth
+    scaled_width = window_left_scale * left_halfwidth + window_right_scale * right_halfwidth
+    n_window = max(10, int(round(n * scaled_width / base_width))) if base_width > 0 else n
+
+    _, zero_one_counts, zero_one_edges, zero_one_centers = _make_histogram(data, zero_one_range, n_window, max_bins=2000)
     max_zero_one_counts = max(zero_one_counts)
 
     if max_zero_one_counts == 0:
@@ -238,7 +282,8 @@ def _auto_zero_one_setup(data, zero_one_test_range, n):
 
 #---------------- (1) Calculate noise / gain ----------------------------
 
-def calculate_noise_gain(data, zero_one_test_range='auto', n=100, fit_bounds='default'):
+def calculate_noise_gain(data, zero_one_test_range='auto', n=100, fit_bounds='default',
+                         window_left_scale=1.0, window_right_scale=1.0):
 
     data = np.array(data).flatten()
     data = data[np.isfinite(data)]
@@ -250,6 +295,8 @@ def calculate_noise_gain(data, zero_one_test_range='auto', n=100, fit_bounds='de
         data,
         zero_one_test_range,
         n,
+        window_left_scale=window_left_scale,
+        window_right_scale=window_right_scale,
     )
     zero_one_centers = 0.5 * (zero_one_edges[:-1] + zero_one_edges[1:])
 
@@ -571,7 +618,7 @@ def _zero_one_ylim(ylim, yscale, counts, fit_y):
     """
     if isinstance(ylim, str) and ylim == 'default':
         if yscale == 'log':
-            return 0, np.max(counts) * 1e4
+            return 0.5, np.max(counts) * 1e4
         if yscale == 'linear':
             return 0, np.max(counts) + 2.5e4
         return None
@@ -633,8 +680,8 @@ def plot_zero_one_peaks(data_ext,
                         plot_individual=False,
                         plot_together=True,
                         do_plot_adu=True,
-                        sharex=True,
-                        sharey=True,
+                        sharex=False,
+                        sharey=False,
                         show_titles=True,
                         save_plots=False,
                         show_plots=True,
@@ -666,34 +713,31 @@ def plot_zero_one_peaks(data_ext,
             ax.set_ylabel('N')
 
             double_gauss_coeff = tuple(double_gauss_popt)+(gain,)
-            data_window = data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
-            nbins=int(n*(zero_one_range[1] - zero_one_range[0]))
-
-            bin_width = zero_one_edges[1] - zero_one_edges[0]
-            zero_one_centers = 0.5 * (zero_one_edges[:-1] + zero_one_edges[1:])
+            window_max = np.max(zero_one_counts)  # zero-peak height, drives y-scaling
 
             if yscale=='log':
-                zero_one_counts = np.maximum(zero_one_counts, 1) #need in order to prevent empty bars in histogram if there are any bins that have 0 counts (log(0) is infinite)
                 ax.set_yscale('log')
             elif yscale!='linear':
                 ax.set_yscale(yscale)
-            ax.bar(zero_one_edges[:-1], zero_one_counts, edgecolor='none', linewidth=0, align='edge', width=np.diff(zero_one_edges))
-            
-            ax.plot(zero_one_centers, double_gauss(zero_one_centers, *double_gauss_popt), 'r',
+            ax.stairs(_bar_heights(zero_one_counts, yscale), zero_one_edges, fill=True)
+
+            curve_x = _fit_curve_x(zero_one_range[0], zero_one_range[1], len(zero_one_counts))
+            ax.plot(curve_x, double_gauss(curve_x, *double_gauss_popt), 'r',
                 label=r'$\sigma_0$ = %5.3f, $\mu_0$ = %5.3f, $\sigma_1$ = %5.3f, $\mu_1$ = %5.3f,'%double_gauss_coeff[0:4]
                 +'\n'+'$N_0$ = %5.3f, $N_1$ = %5.3f, gain = %5.3f ADU/$e^{–}$'%double_gauss_coeff[4:])
             ax.legend(loc="upper right", fontsize=fontsize)
-            
+
             if xlim=='default':
-                ax.set_xlim(zero_one_range[0],zero_one_range[1])
-            elif xlim!='none':
+                ax.set_xlim(zero_one_range[0], zero_one_range[1])
+            elif xlim is not None and xlim!='none':
                 ax.set_xlim(xlim)
-            
+            # xlim is None or 'none': leave autoscaled to the full data extent
+
             if ylim=='default':
                 if yscale=='log':
-                    ax.set_ylim(0, np.max(zero_one_counts) * 1e4)
+                    ax.set_ylim(0.5, window_max * 1e4)
                 elif yscale=='linear':
-                    ax.set_ylim(0, np.max(zero_one_counts) + 3e4)
+                    ax.set_ylim(0, window_max + 3e4)
             elif ylim!='none':
                 ax.set_ylim(ylim)
 
@@ -714,11 +758,15 @@ def plot_zero_one_peaks(data_ext,
 
                 data_window_e = convert_to_electrons(data_window, pedestal, gain)
                 zero_one_range_e = convert_to_electrons(zero_one_range, pedestal, gain)
-                nbins = int(n * (zero_one_range_e[1] - zero_one_range_e[0]))
+                # Match the (scale-adjusted) ADU fit-window bin count so the electron
+                # plot keeps the same bins-to-window ratio when the window is widened.
+                nbins = len(zero_one_counts_ext[ext])
 
+                # Window histogram (used to refit the electron-unit double Gaussian).
                 zero_one_counts_e, zero_one_edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
                 zero_one_centers_e = 0.5 * (zero_one_edges_e[:-1] + zero_one_edges_e[1:])
                 bin_width_e = zero_one_edges_e[1] - zero_one_edges_e[0]
+                window_max_e = np.max(zero_one_counts_e)
 
                 double_gauss_popt_e, _ = _fit_double_gauss_electrons(
                     zero_one_centers_e, zero_one_counts_e, double_gauss_popts[ext], pedestal, gain)
@@ -728,29 +776,30 @@ def plot_zero_one_peaks(data_ext,
                     ax.set_title(rf'{additional_title}{suptitle} (Nimages = {nimages}): EXT {ext + 1}', fontsize=12, pad=10)
 
                 if yscale=='log':
-                    zero_one_counts_e = np.maximum(zero_one_counts_e, 1)
                     ax.set_yscale('log')
                 elif yscale!='linear':
                     ax.set_yscale(yscale)
 
-                ax.bar(zero_one_edges_e[:-1], zero_one_counts_e, align='edge', edgecolor='none', linewidth=0, width=np.diff(zero_one_edges_e))
+                ax.stairs(_bar_heights(zero_one_counts_e, yscale), zero_one_edges_e, fill=True)
                 ax.set_xlabel(r'Charge ($e^–$)')
                 ax.set_ylabel('N')
-                ax.plot(zero_one_centers_e, double_gauss(zero_one_centers_e, *double_gauss_popt_e), 'r',
+                curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(zero_one_counts_e))
+                ax.plot(curve_x_e, double_gauss(curve_x_e, *double_gauss_popt_e), 'r',
                     label=r'$\sigma_0$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\sigma_1$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:4]
                     +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
                 ax.legend(loc="upper right", fontsize=fontsize)
 
                 if xlim=='default':
                     ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
-                elif xlim!='none':
+                elif xlim is not None and xlim!='none':
                     ax.set_xlim(xlim)
+                # xlim is None or 'none': leave autoscaled to the full data extent
 
                 if ylim_electrons=='default':
                     if yscale=='log':
-                        ax.set_ylim(0, np.max(zero_one_counts_e) * 1e4)
+                        ax.set_ylim(0.5, window_max_e * 1e4)
                     elif yscale=='linear':
-                        ax.set_ylim(0, np.max(zero_one_counts_e) + 2.5e4)
+                        ax.set_ylim(0, window_max_e + 2.5e4)
                 elif ylim_electrons!='none':
                     ax.set_ylim(ylim_electrons)
 
@@ -780,22 +829,17 @@ def plot_zero_one_peaks(data_ext,
 
                 ax = axs[ext]
                 double_gauss_coeff = tuple(double_gauss_popt)+(gain,)
-                data_window = data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
-                nbins=int(n*(zero_one_range[1]-zero_one_range[0]))
-
-                zero_one_centers = 0.5 * (zero_one_edges[:-1] + zero_one_edges[1:])
-                bin_width = zero_one_edges[1] - zero_one_edges[0]
 
                 if yscale=='log':
-                    zero_one_counts = np.maximum(zero_one_counts, 1) #need in order to prevent empty bars in histogram if there are any bins that have 0 counts
                     ax.set_yscale('log')
                 elif yscale!='linear':
                     ax.set_yscale(yscale)
 
-                ax.bar(zero_one_centers, zero_one_counts, align='center', edgecolor='none', linewidth=0, width=bin_width)
+                ax.stairs(_bar_heights(zero_one_counts, yscale), zero_one_edges, fill=True)
 
-                fit_y = double_gauss(zero_one_centers, *double_gauss_popt)
-                ax.plot(zero_one_centers, fit_y, 'r',
+                curve_x = _fit_curve_x(zero_one_range[0], zero_one_range[1], len(zero_one_counts))
+                fit_y = double_gauss(curve_x, *double_gauss_popt)
+                ax.plot(curve_x, fit_y, 'r',
                     label=r'$\sigma_0$ = %5.3f, $\mu_0$ = %5.3f, $\sigma_1$ = %5.3f, $\mu_1$ = %5.3f,'%double_gauss_coeff[0:4]
                     +'\n'+'$N_0$ = %5.3f, $N_1$ = %5.3f, gain = %5.3f ADU/$e^{–}$'%double_gauss_coeff[4:])
 
@@ -805,9 +849,10 @@ def plot_zero_one_peaks(data_ext,
                 ax.legend(loc="upper right", fontsize=fontsize - 2)
 
                 if xlim=='default':
-                    ax.set_xlim(zero_one_range[0],zero_one_range[1])
-                elif xlim!='none':
+                    ax.set_xlim(zero_one_range[0], zero_one_range[1])
+                elif xlim is not None and xlim!='none':
                     ax.set_xlim(xlim)
+                # xlim is None or 'none': leave autoscaled to the full data extent
 
                 lim = _zero_one_ylim(ylim, yscale, zero_one_counts, fit_y)
                 _ylims.append(lim)
@@ -853,30 +898,29 @@ def plot_zero_one_peaks(data_ext,
 
                 data_window_e = convert_to_electrons(data_window, pedestal, gain)
                 zero_one_range_e = convert_to_electrons(zero_one_range, pedestal, gain)
-                nbins = int(n * (zero_one_range_e[1] - zero_one_range_e[0]))
+                # Match the (scale-adjusted) ADU fit-window bin count so the electron
+                # plot keeps the same bins-to-window ratio when the window is widened.
+                nbins = len(zero_one_counts_ext[ext])
 
+                # Window histogram (used to refit the electron-unit double Gaussian).
                 zero_one_counts_e, zero_one_edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
                 zero_one_centers_e = 0.5 * (zero_one_edges_e[:-1] + zero_one_edges_e[1:])
                 bin_width_e = zero_one_edges_e[1] - zero_one_edges_e[0]
-
-                zero_one_counts=zero_one_counts_ext[ext]
-                zero_one_edges=zero_one_edges_ext[ext]
 
                 double_gauss_popt_e, _ = _fit_double_gauss_electrons(
                     zero_one_centers_e, zero_one_counts_e, double_gauss_popts[ext], pedestal, gain)
 
                 if yscale=='log':
-                    zero_one_counts_e = np.maximum(zero_one_counts_e, 1) #need in order to prevent empty bars in histogram if there are any bins that have 0 counts
                     ax.set_yscale('log')
-
                 elif yscale!='linear':
                     ax.set_yscale(yscale)
 
-                ax.bar(zero_one_centers_e, zero_one_counts_e, align='center', edgecolor='none', linewidth=0, width=bin_width_e)
+                ax.stairs(_bar_heights(zero_one_counts_e, yscale), zero_one_edges_e, fill=True)
 
                 ax.set_title(f'EXT {ext + 1}')
-                fit_y_e = double_gauss(zero_one_centers_e, *double_gauss_popt_e)
-                ax.plot(zero_one_centers_e, fit_y_e, 'r',
+                curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(zero_one_counts_e))
+                fit_y_e = double_gauss(curve_x_e, *double_gauss_popt_e)
+                ax.plot(curve_x_e, fit_y_e, 'r',
                     label=r'$\sigma_0$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\sigma_1$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:4]
                     +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
                 ax.legend(loc="upper right", fontsize=fontsize - 2)
@@ -885,8 +929,9 @@ def plot_zero_one_peaks(data_ext,
 
                 if xlim=='default':
                     ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
-                elif xlim!='none':
+                elif xlim is not None and xlim!='none':
                     ax.set_xlim(xlim)
+                # xlim is None or 'none': leave autoscaled to the full data extent
 
                 lim = _zero_one_ylim(ylim_electrons, yscale, zero_one_counts_e, fit_y_e)
                 _ylims.append(lim)
@@ -947,7 +992,8 @@ def _value_for_extension(value, ext, n_ext):
     return value
 
 def get_zero_one_peaks_ext(data_ext,
-                           n=100, fit_bounds='default', zero_one_test_range='auto'):
+                           n=100, fit_bounds='default', zero_one_test_range='auto',
+                           window_left_scale=1.0, window_right_scale=1.0):
     zero_one_counts_ext = []
     zero_one_edges_ext = []
     pedestals = []
@@ -963,6 +1009,8 @@ def get_zero_one_peaks_ext(data_ext,
             zero_one_test_range=zero_one_test_range_ext,
             n=n,
             fit_bounds=fit_bounds,
+            window_left_scale=window_left_scale,
+            window_right_scale=window_right_scale,
         )
         zero_one_counts_ext.append(zero_one_counts)
         zero_one_edges_ext.append(zero_one_edges)
