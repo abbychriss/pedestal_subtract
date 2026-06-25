@@ -9,7 +9,9 @@ Given a FITS image with extensions 1–4 of pixel charge data, this package:
 
 1. **Loads** the four extensions (`get_fits`).
 2. **Pedestal-subtracts** each extension row-by-row (or column-wise), iteratively
-   sigma-clipping to the zero-electron peak core. Results are cached to a
+   sigma-clipping to the zero-electron peak core. Optionally, the per-row pedestal
+   can be estimated from only the serial-overscan columns (`--use_overscan_only`)
+   and still subtracted from the full frame. Results are cached to a
    `*.pedsub.fits` file next to the source so reruns with the same parameters skip
    the recompute (`pedestal_subtract_ext_cached`).
 3. **Fits the zero/one-electron peaks** of each extension with a double Gaussian,
@@ -22,13 +24,14 @@ Given a FITS image with extensions 1–4 of pixel charge data, this package:
 From this directory (`pedestal_subtract/`, the one containing `pyproject.toml`):
 
 ```bash
-pip install -e .          # editable install (recommended while developing)
-# or
 pip install .
 ```
+or in editable mode
+```bash
+pip install -e .
+```
 
-This installs the importable `pedestal_subtract` package and a `pedestal-subtract`
-console command.
+This installs the importable `pedestal_subtract` package and a `pedestal-subtract` command.
 
 ## Running
 
@@ -44,14 +47,14 @@ Or run it as a module (works installed, or from this directory without installin
 python -m pedestal_subtract path/to/image.fits
 ```
 
-Save plots without displaying them, and also produce the electron-units version:
+Save plots without displaying them, and also produce the electron version:
 
 ```bash
 python -m pedestal_subtract path/to/image.fits \
     --save_plots --no-show_plots --plot_zero_one_electrons -o ./plots
 ```
 
-Drive everything from a JSON config (CLI flags override config values):
+If you want to configure the parameters yourself, you can use a JSON config (CLI flags override config values):
 
 ```bash
 python -m pedestal_subtract -j config.json path/to/image.fits
@@ -70,6 +73,8 @@ python -m pedestal_subtract --help
 | `--no-do_pedestal_subtraction` | (on) | Skip pedestal subtraction. |
 | `--n_std_to_mask` | `1.5` | Sigma-clip width when estimating the pedestal. |
 | `--pedestal_subtraction_axis` | `row` | `row`, `col`, `row_then_col`, or `col_then_row`. |
+| `--use_overscan_only [EXT ...]` | off | Estimate the per-row pedestal from the overscan columns only (then subtract it from the full frame). Pass extension numbers (1–4) to apply to only those extensions, or the flag alone to apply to all; in the JSON config use `true`/`false` or a list like `[1, 3]`. Use `--no-use_overscan_only` to force it off. |
+| `--overscan_cols START STOP` | `-147 :` (last 147 cols) | Column slice the pedestal is estimated from when `--use_overscan_only` is set. Negative endpoints count from the right; in the JSON config use `null` for an open-ended slice (e.g. `[-147, null]`). |
 | `--force_pedsub` | off | Recompute, ignoring the on-disk cache. |
 | `--pedsub_cache_dir DIR` | source dir | Where to write the `*.pedsub.fits` cache. |
 | `-z` / `--plot_zero_one_adu` | on | Plot fits in ADU. |
@@ -77,6 +82,10 @@ python -m pedestal_subtract --help
 | `--plot_zero_one_yscale` | `linear` | `linear` or `log`. |
 | `-s` / `--save_plots` | off | Save plots to `--output_dir`. |
 | `--no-show_plots` | (shows) | Don't open figures interactively. |
+
+When saving to disk, each run is stored in a unique subfolder named with a short
+hash of the analysis-relevant config. The complete resolved config is also
+written to `config.json` inside that folder for reproducibility.
 
 ## Config compatibility with `nonlinearity_studies`
 
@@ -93,12 +102,17 @@ Keys outside this package's scope (e.g. `peak_finder_*`, `fit_range_right`,
 as in `nonlinearity_studies`. The keys this package consumes:
 
 `file_string`, `do_pedestal_subtraction`, `n_std_to_mask`, `pedestal_subtraction_axis`,
+`use_overscan_only`, `overscan_cols`,
 `pedsub_cache_dir`, `force_pedsub`, `use_biweight_loc`, `use_biweight_midvar`,
 `plot_zero_one_adu`, `plot_zero_one_electrons`, `plot_zero_one_individual`,
 `plot_zero_one_together`, `plot_zero_one_yscale`, `plot_zero_one_individual_figsize`,
 `plot_zero_one_subplots_figsize`, `plot_zero_one_sharex`, `plot_zero_one_sharey`,
 `extra_plot_title`, `nimages`, `show_titles`, `save_plots`, `show_plots`,
 `output_dir`, `verbose`.
+
+`use_overscan_only` and `overscan_cols` are additions specific to this package (not
+present in `nonlinearity_studies`); older configs without them fall back to the
+defaults (overscan-only off).
 
 ## Using inside `nonlinearity_studies`
 
@@ -127,6 +141,12 @@ from pedestal_subtract import (
 data_ext = get_fits("image.fits")
 data_ext = pedestal_subtract_ext_cached(data_ext, source_path="image.fits",
                                         n_std_to_mask=1.5, axis="row")
+# Estimate the per-row pedestal from the overscan columns only, applied full-frame.
+# overscan_cols may be a single (c0, c1) pair (all extensions) or a per-extension
+# list of None/(c0, c1) -- here exts 1 and 3 use the overscan, exts 2 and 4 the full frame:
+# data_ext = pedestal_subtract_ext_cached(data_ext, source_path="image.fits",
+#                                         n_std_to_mask=1.5, axis="row",
+#                                         overscan_cols=[(-147, None), None, (-147, None), None])
 (counts, edges, pedestals, gains,
  popts, ranges) = get_zero_one_peaks_ext(data_ext, n=100)
 ```

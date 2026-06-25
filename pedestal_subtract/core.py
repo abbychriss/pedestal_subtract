@@ -98,10 +98,20 @@ def _auto_zero_one_setup(data, zero_one_test_range, n):
     )
 
     if use_auto_range:
-        range_left, range_right = np.percentile(data, [0.1, 80])
-
-        if not np.isfinite(range_left) or not np.isfinite(range_right) or range_right <= range_left:
-            range_left, range_right = np.percentile(data, [0, 90])
+        # Anchor the window on robust statistics. Using a low percentile for the
+        # left edge (e.g. the 0.1th) lets a heavy outlier tail -- such as the
+        # large +/-1e4 ADU artefact pixels in averaged images -- drag range_left
+        # thousands of ADU away from the zero peak, blowing the histogram bin
+        # width up to several ADU. The zero-peak width is then overestimated,
+        # which later suppresses a real one-electron peak as "too close" to the
+        # zero peak. Instead centre on the median (the zero peak) and mirror the
+        # 80th-percentile half-width about it, with a robust-sigma floor so the
+        # window always spans the zero peak.
+        median = float(np.median(data))
+        mad = float(np.median(np.abs(data - median)))
+        robust_sigma = 1.4826 * mad
+        half_width = max(np.percentile(data, 80) - median, 3 * robust_sigma)
+        range_left, range_right = median - half_width, median + half_width
 
         if not np.isfinite(range_left) or not np.isfinite(range_right) or range_right <= range_left:
             range_left = np.min(data)
@@ -228,7 +238,7 @@ def _auto_zero_one_setup(data, zero_one_test_range, n):
 
 #---------------- (1) Calculate noise / gain ----------------------------
 
-def calculate_noise_gain(data, zero_one_test_range='auto', n=200, fit_bounds='default'):
+def calculate_noise_gain(data, zero_one_test_range='auto', n=100, fit_bounds='default'):
 
     data = np.array(data).flatten()
     data = data[np.isfinite(data)]
@@ -261,7 +271,16 @@ def calculate_noise_gain(data, zero_one_test_range='auto', n=200, fit_bounds='de
 
 def pedestal_subtract(data, n_std_to_mask, axis='row', use_biweight_loc=True,
                       use_biweight_midvar=True, max_iter=5, tol=0.01,
-                      verbose=False, label=''):
+                      verbose=False, label='', overscan_cols=None):
+    """
+    overscan_cols : tuple(int, int) or None
+        When set to ``(c0, c1)``, the per-row pedestal is *estimated* only from
+        columns ``c0:c1`` (a Python half-open slice, e.g. the serial overscan)
+        but *subtracted* from the full row. This only affects the per-row step
+        (``'row'``, and the row half of ``'row_then_col'`` / ``'col_then_row'``);
+        the per-column step always uses every row, since restricting columns
+        there would not produce a pedestal for the columns outside the slice.
+    """
 
     data = np.array(data, dtype=float)
     log_prefix = f'  [pedsub] {label} ' if label else '  [pedsub] '
@@ -276,8 +295,15 @@ def pedestal_subtract(data, n_std_to_mask, axis='row', use_biweight_loc=True,
             return np.sqrt(biweight_midvariance(arr, axis=ax, ignore_nan=True))  # returns variance, not std
         return np.nanstd(arr, axis=ax)
 
-    def subtract_along(arr, ax, ax_name):
+    def subtract_along(arr, ax, ax_name, sample=None):
         # ax=1 subtracts a per-row pedestal; ax=0 subtracts a per-column pedestal.
+        #
+        # `sample` (when given) is the sub-array the pedestal is ESTIMATED from --
+        # e.g. just the overscan columns -- while the resulting per-line pedestal is
+        # still SUBTRACTED from the full `arr`. It must share `arr`'s length along the
+        # output axis (the complement of `ax`) so the estimate broadcasts back over the
+        # full frame; for ax=1 that means the same number of rows. When None, the
+        # estimate is drawn from `arr` itself (the original behaviour).
         #
         # Iteratively sigma-clip to the zero-peak core: each pass recomputes BOTH the
         # location and the scale from the surviving (clipped) pixels, so the mask width
@@ -294,16 +320,17 @@ def pedestal_subtract(data, n_std_to_mask, axis='row', use_biweight_loc=True,
         # mask never repeats exactly and the max shift never settles. The median ignores
         # that thin tail and reflects when the pedestal has actually stabilized. Capped
         # at max_iter for the (noisy, overlapping) lines that need the full budget.
-        center = _loc(arr, ax)
-        sigma = _scale(arr, ax)
+        est = arr if sample is None else sample
+        center = _loc(est, ax)
+        sigma = _scale(est, ax)
         shift = np.inf
         n_iter = 0
         for _ in range(max_iter):
             n_iter += 1
             center_b = np.expand_dims(center, axis=ax)
             sigma_b = np.expand_dims(sigma, axis=ax)
-            mask = np.abs(arr - center_b) <= n_std_to_mask * sigma_b
-            masked = np.where(mask, arr, np.nan)
+            mask = np.abs(est - center_b) <= n_std_to_mask * sigma_b
+            masked = np.where(mask, est, np.nan)
 
             new_center = _loc(masked, ax)
             sigma = _scale(masked, ax)
@@ -322,14 +349,24 @@ def pedestal_subtract(data, n_std_to_mask, axis='row', use_biweight_loc=True,
 
         return arr - np.expand_dims(center, axis=ax)
 
+    def _row_sample(arr):
+        # Sub-array (overscan columns) the per-row pedestal is estimated from.
+        if overscan_cols is None:
+            return None
+        c0, c1 = overscan_cols
+        return arr[:, c0:c1]
+
     if axis == 'row':
-        return subtract_along(data, 1, 'row')
+        return subtract_along(data, 1, 'row', sample=_row_sample(data))
     elif axis in ('column', 'col'):
+        # overscan_cols does not apply to a per-column pedestal (see docstring).
         return subtract_along(data, 0, 'col')
     elif axis == 'row_then_col':
-        return subtract_along(subtract_along(data, 1, 'row'), 0, 'col')
+        row_sub = subtract_along(data, 1, 'row', sample=_row_sample(data))
+        return subtract_along(row_sub, 0, 'col')
     elif axis == 'col_then_row':
-        return subtract_along(subtract_along(data, 0, 'col'), 1, 'row')
+        col_sub = subtract_along(data, 0, 'col')
+        return subtract_along(col_sub, 1, 'row', sample=_row_sample(col_sub))
 
     return data
 
@@ -339,17 +376,95 @@ def pedestal_subtract(data, n_std_to_mask, axis='row', use_biweight_loc=True,
 
 _PEDSUB_ALGO_VERSION = 2
 
-_PEDSUB_HEADER_KEYS = ('PEDSUB_A', 'PEDSUB_N', 'PEDSUB_L', 'PEDSUB_V', 'PEDSUB_R', 'PEDSUB_I')
+_PEDSUB_HEADER_KEYS = ('PEDSUB_A', 'PEDSUB_N', 'PEDSUB_L', 'PEDSUB_V', 'PEDSUB_R', 'PEDSUB_I', 'PEDSUB_O')
 
-def _pedsub_cache_path(source_path, cache_dir=None):
+
+def _overscan_range_token(overscan_cols):
+    """Token for a single extension's overscan range.
+
+    ``None`` -> 'f' (estimate that extension from the full frame). Otherwise a
+    ``(c0, c1)`` slice, with endpoints that may be negative (counted from the right)
+    or ``None`` (open-ended slice), encoded so the token is filename- and
+    header-string-safe.
+    """
+    if overscan_cols is None:
+        return 'f'
+    c0, c1 = overscan_cols
+
+    def _fmt(v):
+        if v is None:
+            return 'e'                 # open-ended slice endpoint
+        return str(int(v)).replace('-', 'm')   # 'm' keeps negatives filename-safe
+
+    return f'{_fmt(c0)}t{_fmt(c1)}'
+
+
+def _overscan_key(overscan_cols_per_ext):
+    """Filename/header-safe token for the per-extension overscan configuration.
+
+    Takes a list with one entry per extension, each either ``None`` (estimate that
+    extension's pedestal from the full frame) or a ``(c0, c1)`` column slice. Returns
+    'none' when no extension uses overscan-only estimation, so runs that touch no
+    extension share a cache with the plain full-frame result.
+    """
+    if not overscan_cols_per_ext or all(o is None for o in overscan_cols_per_ext):
+        return 'none'
+    return '-'.join(_overscan_range_token(o) for o in overscan_cols_per_ext)
+
+
+def _normalize_overscan_cols_ext(overscan_cols, n_ext):
+    """Normalize the ``overscan_cols`` argument into a length-``n_ext`` per-extension list.
+
+    Accepts ``None`` (no extension uses overscan), a single ``(c0, c1)`` pair (applied
+    to every extension), or an explicit length-``n_ext`` list whose entries are each
+    ``None`` or a ``(c0, c1)`` pair.
+    """
+    if overscan_cols is None:
+        return [None] * n_ext
+    # Explicit per-extension list (checked first so a 2-extension file isn't mistaken
+    # for a single range): every entry must be None or a 2-sequence.
+    if isinstance(overscan_cols, list) and len(overscan_cols) == n_ext and all(
+            o is None or (isinstance(o, (list, tuple)) and len(o) == 2) for o in overscan_cols):
+        return [tuple(o) if o is not None else None for o in overscan_cols]
+    # A single (c0, c1) range -> apply to every extension.
+    if isinstance(overscan_cols, (list, tuple)) and len(overscan_cols) == 2 and all(
+            v is None or isinstance(v, (int, np.integer)) for v in overscan_cols):
+        return [tuple(overscan_cols)] * n_ext
+    raise ValueError(
+        f"overscan_cols must be None, a (c0, c1) pair, or a length-{n_ext} per-extension "
+        f"list of None/(c0, c1); got {overscan_cols!r}")
+
+
+def _pedsub_param_key(axis, n_std_to_mask, use_biweight_loc, use_biweight_midvar,
+                      max_iter, overscan_cols=None):
+    """Compact filename-safe key for the params that define a distinct pedsub result.
+
+    Mirrors the fields checked by ``_pedsub_header_matches`` so that every distinct
+    parameter combination maps to its own cache file (e.g. row vs column live in
+    separate files and don't overwrite each other).
+    """
+    return (f"{axis}_n{float(n_std_to_mask):g}"
+            f"_l{int(bool(use_biweight_loc))}_v{int(bool(use_biweight_midvar))}"
+            f"_i{int(max_iter)}_o{_overscan_key(overscan_cols)}_a{_PEDSUB_ALGO_VERSION}")
+
+
+def _pedsub_cache_path(source_path, cache_dir=None, *, axis=None, n_std_to_mask=None,
+                       use_biweight_loc=True, use_biweight_midvar=True, max_iter=5,
+                       overscan_cols=None):
     source = Path(source_path)
     base = cache_dir if cache_dir is not None else source.parent
     base = Path(base)
     if cache_dir is not None:
         base.mkdir(parents=True, exist_ok=True)
-    return base / f'{source.stem}.pedsub.fits'
+    if axis is None:
+        # Legacy single-slot path (no params supplied).
+        return base / f'{source.stem}.pedsub.fits'
+    key = _pedsub_param_key(axis, n_std_to_mask, use_biweight_loc,
+                            use_biweight_midvar, max_iter, overscan_cols)
+    return base / f'{source.stem}.pedsub.{key}.fits'
 
-def _pedsub_header_matches(header, axis, n_std_to_mask, use_biweight_loc, use_biweight_midvar, max_iter):
+def _pedsub_header_matches(header, axis, n_std_to_mask, use_biweight_loc,
+                           use_biweight_midvar, max_iter, overscan_cols=None):
     if not all(k in header for k in _PEDSUB_HEADER_KEYS):
         return False
     return (
@@ -359,22 +474,42 @@ def _pedsub_header_matches(header, axis, n_std_to_mask, use_biweight_loc, use_bi
         and bool(header['PEDSUB_V']) == bool(use_biweight_midvar)
         and int(header['PEDSUB_R']) == _PEDSUB_ALGO_VERSION
         and int(header['PEDSUB_I']) == int(max_iter)
+        and str(header['PEDSUB_O']) == _overscan_key(overscan_cols)
     )
 
 def pedestal_subtract_ext_cached(data_ext, source_path, n_std_to_mask, axis='row',
                                  use_biweight_loc=True, use_biweight_midvar=True,
-                                 max_iter=5, cache_dir=None, force=False, verbose=True):
+                                 max_iter=5, cache_dir=None, force=False, verbose=True,
+                                 overscan_cols=None):
     """Pedestal-subtract each extension, caching the result to a FITS file next to the source.
 
-    On rerun, if the cache exists and its header params match the requested params, the cached
-    arrays are loaded instead of recomputing. Pass force=True to bypass the cache.
+    Each distinct parameter combination (axis, n_std_to_mask, biweight flags, max_iter,
+    algorithm version) is cached to its own file, so switching e.g. axis from 'row' to
+    'column' and back reuses each previously computed result instead of overwriting it.
+
+    On rerun, if the matching cache exists and its header params agree with the requested
+    params, the cached arrays are loaded instead of recomputing. Pass force=True to bypass
+    the cache.
+
+    ``overscan_cols`` may be None (no extension uses overscan-only estimation), a single
+    ``(c0, c1)`` pair applied to every extension, or a per-extension list of None/(c0, c1)
+    so individual extensions can be estimated from their overscan columns or the full frame.
     """
-    cache_path = _pedsub_cache_path(source_path, cache_dir)
+    # Resolve overscan to one entry per extension up front, so the cache identity and the
+    # per-extension calls below agree.
+    overscan_cols_ext = _normalize_overscan_cols_ext(overscan_cols, len(data_ext))
+
+    cache_path = _pedsub_cache_path(source_path, cache_dir, axis=axis,
+                                    n_std_to_mask=n_std_to_mask,
+                                    use_biweight_loc=use_biweight_loc,
+                                    use_biweight_midvar=use_biweight_midvar,
+                                    max_iter=max_iter, overscan_cols=overscan_cols_ext)
 
     if not force and cache_path.exists():
         with fits.open(str(cache_path)) as hdul:
             if _pedsub_header_matches(hdul[0].header, axis, n_std_to_mask,
-                                       use_biweight_loc, use_biweight_midvar, max_iter):
+                                       use_biweight_loc, use_biweight_midvar, max_iter,
+                                       overscan_cols_ext):
                 if verbose:
                     print(f'Loading cached pedestal-subtracted data from {cache_path}')
                 return [hdul[i].data.copy() for i in range(1, len(hdul))]
@@ -390,7 +525,8 @@ def pedestal_subtract_ext_cached(data_ext, source_path, n_std_to_mask, axis='row
     pedsub_data_ext = [
         pedestal_subtract(data, n_std_to_mask=n_std_to_mask, axis=axis,
                           use_biweight_loc=use_biweight_loc, use_biweight_midvar=use_biweight_midvar,
-                          max_iter=max_iter, verbose=verbose, label=f'EXT {i + 1}')
+                          max_iter=max_iter, verbose=verbose, label=f'EXT {i + 1}',
+                          overscan_cols=overscan_cols_ext[i])
         for i, data in enumerate(iterable)
     ]
 
@@ -401,6 +537,7 @@ def pedestal_subtract_ext_cached(data_ext, source_path, n_std_to_mask, axis='row
     primary.header['PEDSUB_V'] = (bool(use_biweight_midvar), 'use biweight midvariance')
     primary.header['PEDSUB_R'] = (_PEDSUB_ALGO_VERSION, 'pedestal subtraction algorithm version')
     primary.header['PEDSUB_I'] = (int(max_iter), 'pedestal subtraction max iterations')
+    primary.header['PEDSUB_O'] = (_overscan_key(overscan_cols_ext), 'per-ext overscan cols for pedestal estimate')
     primary.header['SRC_FITS'] = (str(source_path)[-68:], 'source FITS file (truncated)')
     hdul_out = fits.HDUList([primary] + [fits.ImageHDU(data=arr) for arr in pedsub_data_ext])
     hdul_out.writeto(str(cache_path), overwrite=True)
@@ -412,15 +549,37 @@ def pedestal_subtract_ext_cached(data_ext, source_path, n_std_to_mask, axis='row
 #---------------- Plotting: zero-one peaks ----------------------------
 
 def _finish_fig(show_plots):
-    """Display the current figure interactively, or close it to free memory when not showing.
+    """Display the current figure interactively (blocking), or close it when not showing.
 
-    Gating plt.show() this way keeps the active (GUI) backend intact, so disabling display
-    doesn't trip matplotlib's "non-interactive backend cannot show the figure" warning.
+    plt.show() displays every figure still registered with pyplot, so the current
+    figure must be closed once the user dismisses its window; otherwise the next
+    figure's plt.show() re-raises this one too and interactive GUI backends (notably
+    macOS) pop up duplicates. Closing right after the blocking show keeps figures
+    appearing one at a time with a clean registry. When not showing, the figure is
+    closed immediately to free memory.
     """
     if show_plots:
         plt.show()
-    else:
-        plt.close()
+    plt.close()
+
+def _zero_one_ylim(ylim, yscale, counts, fit_y):
+    """Per-extension (low, high) for a zero-one subplot, or None to leave autoscaling.
+
+    `counts`/`fit_y` are the bar heights and fitted curve for the extension and drive the
+    autoscale ('none'/None) case, so callers can share a y-axis across extensions by taking
+    the minimum low and maximum high of every extension's returned range.
+    """
+    if isinstance(ylim, str) and ylim == 'default':
+        if yscale == 'log':
+            return 0, np.max(counts) * 1e4
+        if yscale == 'linear':
+            return 0, np.max(counts) + 2.5e4
+        return None
+    if ylim is None or ylim == 'none':
+        if yscale != 'linear':
+            return None  # let matplotlib pick a sensible (e.g. log) range per axis
+        return 0, max(np.max(counts), np.max(fit_y)) * 1.05
+    return ylim[0], ylim[1]
 
 def _fit_double_gauss_electrons(centers_e, counts_e, double_gauss_popt, pedestal, gain, maxfev=5000):
     """Fit the zero/one peak histogram in electron units, seeded from the converged ADU fit.
@@ -459,16 +618,17 @@ def plot_zero_one_peaks(data_ext,
                         gains, 
                         double_gauss_popts, 
                         zero_one_ranges,
-                        individual_figsize=(7,5), 
-                        subplots_figsize=(9,7),
+                        individual_figsize=(7,5),
+                        subplots_figsize=(13,9),
                         xlim='default',
                         ylim='default',
+                        ylim_electrons='default',
                         suptitle='Double-Gaussian Fit to Zero-One Electron Peaks',
                         additional_title='',
                         nimages=10,
                         fontsize=9.5,
                         yscale='linear',
-                        n=200,
+                        n=100,
                         do_convert_to_electrons=False,
                         plot_individual=False,
                         plot_together=True,
@@ -533,7 +693,7 @@ def plot_zero_one_peaks(data_ext,
                 if yscale=='log':
                     ax.set_ylim(0, np.max(zero_one_counts) * 1e4)
                 elif yscale=='linear':
-                    ax.set_ylim(0, np.max(zero_one_counts) + 2.5e4)
+                    ax.set_ylim(0, np.max(zero_one_counts) + 3e4)
             elif ylim!='none':
                 ax.set_ylim(ylim)
 
@@ -577,7 +737,8 @@ def plot_zero_one_peaks(data_ext,
                 ax.set_xlabel(r'Charge ($e^–$)')
                 ax.set_ylabel('N')
                 ax.plot(zero_one_centers_e, double_gauss(zero_one_centers_e, *double_gauss_popt_e), 'r',
-                    label=r'$\sigma_0$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\sigma_1$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$'%tuple(double_gauss_popt_e)[0:4])
+                    label=r'$\sigma_0$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\sigma_1$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:4]
+                    +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
                 ax.legend(loc="upper right", fontsize=fontsize)
 
                 if xlim=='default':
@@ -585,13 +746,13 @@ def plot_zero_one_peaks(data_ext,
                 elif xlim!='none':
                     ax.set_xlim(xlim)
 
-                if ylim=='default':
+                if ylim_electrons=='default':
                     if yscale=='log':
                         ax.set_ylim(0, np.max(zero_one_counts_e) * 1e4)
                     elif yscale=='linear':
                         ax.set_ylim(0, np.max(zero_one_counts_e) + 2.5e4)
-                elif ylim!='none':
-                    ax.set_ylim(ylim)
+                elif ylim_electrons!='none':
+                    ax.set_ylim(ylim_electrons)
 
                 if save_plots:
                     output_path = fig_name.with_stem(fig_name.stem + f'_electrons_EXT{ext+1}').with_suffix('.jpeg')
@@ -607,7 +768,7 @@ def plot_zero_one_peaks(data_ext,
                 fig.suptitle(f'{additional_title}{suptitle} (Nimages = {nimages})')
             axs = axs.flatten()
 
-            _default_tops = []
+            _ylims = []
             for ext, data in enumerate(data_ext):
                 data = np.array(data).flatten()
                 zero_one_counts=zero_one_counts_ext[ext]
@@ -633,7 +794,8 @@ def plot_zero_one_peaks(data_ext,
 
                 ax.bar(zero_one_centers, zero_one_counts, align='center', edgecolor='none', linewidth=0, width=bin_width)
 
-                ax.plot(zero_one_centers, double_gauss(zero_one_centers, *double_gauss_popt), 'r',
+                fit_y = double_gauss(zero_one_centers, *double_gauss_popt)
+                ax.plot(zero_one_centers, fit_y, 'r',
                     label=r'$\sigma_0$ = %5.3f, $\mu_0$ = %5.3f, $\sigma_1$ = %5.3f, $\mu_1$ = %5.3f,'%double_gauss_coeff[0:4]
                     +'\n'+'$N_0$ = %5.3f, $N_1$ = %5.3f, gain = %5.3f ADU/$e^{–}$'%double_gauss_coeff[4:])
 
@@ -647,24 +809,17 @@ def plot_zero_one_peaks(data_ext,
                 elif xlim!='none':
                     ax.set_xlim(xlim)
 
-                if ylim=='default':
-                    if yscale=='log':
-                        _top = np.max(zero_one_counts) * 1e4
-                    elif yscale=='linear':
-                        _top = np.max(zero_one_counts) + 2.5e4
-                    else:
-                        _top = None
-                    if _top is not None:
-                        _default_tops.append(_top)
-                        ax.set_ylim(0, _top)
-                elif ylim!='none':
-                    ax.set_ylim(ylim)
+                lim = _zero_one_ylim(ylim, yscale, zero_one_counts, fit_y)
+                _ylims.append(lim)
+                if not sharey and lim is not None:
+                    ax.set_ylim(lim)
 
-            # With sharey=True, the per-axis set_ylim above lets the last extension
-            # determine the shared range -> tall peaks in earlier extensions can be
-            # cut off. Override with the max top so nothing is clipped.
-            if sharey and ylim == 'default' and _default_tops:
-                axs[0].set_ylim(0, max(_default_tops))
+            # With sharey=True every subplot shares one range; span every extension by
+            # taking the minimum low and maximum high so no peak is clipped (the tallest
+            # peak need not be in the same extension as the lowest floor).
+            _valid = [lim for lim in _ylims if lim is not None]
+            if sharey and _valid:
+                axs[0].set_ylim(min(lo for lo, _ in _valid), max(hi for _, hi in _valid))
 
             for i in (0, 1):
                 axs[i].set_xlabel('')
@@ -685,7 +840,7 @@ def plot_zero_one_peaks(data_ext,
                 fig.suptitle(rf'{additional_title}{suptitle} (Nimages = {nimages})')
             axs = axs.flatten()
 
-            _default_tops = []
+            _ylims = []
             for ext, data in enumerate(data_ext):
                 ax = axs[ext]
 
@@ -697,7 +852,7 @@ def plot_zero_one_peaks(data_ext,
                 data_window = data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
 
                 data_window_e = convert_to_electrons(data_window, pedestal, gain)
-                zero_one_range_e = convert_to_electrons(zero_one_range, pedestal, gain) 
+                zero_one_range_e = convert_to_electrons(zero_one_range, pedestal, gain)
                 nbins = int(n * (zero_one_range_e[1] - zero_one_range_e[0]))
 
                 zero_one_counts_e, zero_one_edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
@@ -706,10 +861,10 @@ def plot_zero_one_peaks(data_ext,
 
                 zero_one_counts=zero_one_counts_ext[ext]
                 zero_one_edges=zero_one_edges_ext[ext]
-                
+
                 double_gauss_popt_e, _ = _fit_double_gauss_electrons(
                     zero_one_centers_e, zero_one_counts_e, double_gauss_popts[ext], pedestal, gain)
-                
+
                 if yscale=='log':
                     zero_one_counts_e = np.maximum(zero_one_counts_e, 1) #need in order to prevent empty bars in histogram if there are any bins that have 0 counts
                     ax.set_yscale('log')
@@ -720,8 +875,10 @@ def plot_zero_one_peaks(data_ext,
                 ax.bar(zero_one_centers_e, zero_one_counts_e, align='center', edgecolor='none', linewidth=0, width=bin_width_e)
 
                 ax.set_title(f'EXT {ext + 1}')
-                ax.plot(zero_one_centers_e, double_gauss(zero_one_centers_e, *double_gauss_popt_e), 'r',
-                    label=r'$\sigma_0$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\sigma_1$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$'%tuple(double_gauss_popt_e)[0:4])
+                fit_y_e = double_gauss(zero_one_centers_e, *double_gauss_popt_e)
+                ax.plot(zero_one_centers_e, fit_y_e, 'r',
+                    label=r'$\sigma_0$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\sigma_1$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:4]
+                    +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
                 ax.legend(loc="upper right", fontsize=fontsize - 2)
                 ax.set_xlabel(r'Charge ($e^–$)')
                 ax.set_ylabel('N')
@@ -731,21 +888,14 @@ def plot_zero_one_peaks(data_ext,
                 elif xlim!='none':
                     ax.set_xlim(xlim)
 
-                if ylim=='default':
-                    if yscale=='log':
-                        _top = np.max(zero_one_counts_e) * 1e4
-                    elif yscale=='linear':
-                        _top = np.max(zero_one_counts_e) + 2.5e4
-                    else:
-                        _top = None
-                    if _top is not None:
-                        _default_tops.append(_top)
-                        ax.set_ylim(0, _top)
-                elif ylim!='none':
-                    ax.set_ylim(ylim)
+                lim = _zero_one_ylim(ylim_electrons, yscale, zero_one_counts_e, fit_y_e)
+                _ylims.append(lim)
+                if not sharey and lim is not None:
+                    ax.set_ylim(lim)
 
-            if sharey and ylim == 'default' and _default_tops:
-                axs[0].set_ylim(0, max(_default_tops))
+            _valid = [lim for lim in _ylims if lim is not None]
+            if sharey and _valid:
+                axs[0].set_ylim(min(lo for lo, _ in _valid), max(hi for _, hi in _valid))
 
             for i in (0, 1):
                 axs[i].set_xlabel('')
@@ -797,7 +947,7 @@ def _value_for_extension(value, ext, n_ext):
     return value
 
 def get_zero_one_peaks_ext(data_ext,
-                           n=200, fit_bounds='default', zero_one_test_range='auto'):
+                           n=100, fit_bounds='default', zero_one_test_range='auto'):
     zero_one_counts_ext = []
     zero_one_edges_ext = []
     pedestals = []
