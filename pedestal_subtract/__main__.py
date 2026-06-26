@@ -26,6 +26,8 @@ from . import __version__
 from .core import (
     _PEDSUB_ALGO_VERSION,
     get_fits,
+    get_fits_header,
+    overscan_cols_from_header,
     pedestal_subtract_ext_cached,
     get_zero_one_peaks_ext,
     plot_zero_one_peaks,
@@ -79,6 +81,15 @@ def _window_scale(value):
     f = float(value)
     if f < 1.0:
         raise argparse.ArgumentTypeError(f"must be >= 1.0 (got {f})")
+    return f
+
+
+def _n_bins(value):
+    """argparse type for the zero/one histogram bin count: an integer >= 10
+    (the double-Gaussian has 6 free parameters, so fewer bins is ill-posed)."""
+    f = int(value)
+    if f < 10:
+        raise argparse.ArgumentTypeError(f"must be an integer >= 10 (got {f})")
     return f
 
 
@@ -223,6 +234,11 @@ def init_argparse(argv=None):
                         help="Use std dev for the per-line scale.")
 
     # ----- Fit window -----
+    parser.add_argument("--zero_one_n_bins", type=_n_bins,
+                        default=_config_default(config, 'zero_one_n_bins', 100),
+                        help="Number of bins spanning the zero/one fit window at window "
+                             "scale 1.0 (the count scales up automatically when the window "
+                             "is widened, keeping bin width constant). Integer >= 10. Default 100.")
     parser.add_argument("--zero_one_window_left_scale", type=_window_scale,
                         default=_config_default(config, 'zero_one_window_left_scale', 1.0),
                         help="Scale the left half-width of the auto-computed zero/one fit "
@@ -339,6 +355,9 @@ def init_argparse(argv=None):
     for _scale_arg in ('zero_one_window_left_scale', 'zero_one_window_right_scale'):
         if getattr(args, _scale_arg) < 1.0:
             parser.error(f"{_scale_arg} must be >= 1.0 (got {getattr(args, _scale_arg)})")
+    if int(args.zero_one_n_bins) < 10:
+        parser.error(f"zero_one_n_bins must be an integer >= 10 (got {args.zero_one_n_bins})")
+    args.zero_one_n_bins = int(args.zero_one_n_bins)
 
     return args
 
@@ -347,7 +366,7 @@ def main(argv=None):
     args = init_argparse(argv)
 
     if args.extra_plot_title and not args.extra_plot_title.endswith((' ', '\n')):
-        args.extra_plot_title = f'{args.extra_plot_title}: '
+        args.extra_plot_title = f'{args.extra_plot_title}\n'
 
     if args.file_string is None:
         print('Error: file_string is required unless it is provided in the JSON config.')
@@ -370,7 +389,7 @@ def main(argv=None):
     # Hardcoded parameters that affect the fit results (not display). Defined here
     # so they are both passed to the fit and recorded in the run snapshot.
     fit_params = {
-        'n': 100,
+        'n': args.zero_one_n_bins,
         'fit_bounds': 'default',
         'zero_one_test_range': 'auto',
         'window_left_scale': args.zero_one_window_left_scale,
@@ -406,7 +425,19 @@ def main(argv=None):
     # pedestal from the overscan columns only (still subtracted from the full frame);
     # the rest estimate from the full frame.
     overscan_exts = _overscan_ext_indices(args.use_overscan_only, len(data_ext))
-    overscan_range = tuple(args.overscan_cols)
+    if overscan_exts:
+        # Prefer the overscan columns computed from the CCD-geometry header keys
+        # (PRESCAN, PHYSCOL, NCOL, NCOLPRE, NSBIN); fall back to --overscan_cols /
+        # the config value only when the header lacks those keys.
+        overscan_range = overscan_cols_from_header(get_fits_header(file_path))
+        if overscan_range is None:
+            overscan_range = tuple(args.overscan_cols)
+            if args.verbose:
+                print(f'Overscan columns: header keys not found; using configured {overscan_range}')
+        elif args.verbose:
+            print(f'Overscan columns from header: {overscan_range} (last {-overscan_range[0]} columns)')
+    else:
+        overscan_range = tuple(args.overscan_cols)
     overscan_cols = [overscan_range if i in overscan_exts else None
                      for i in range(len(data_ext))]
 

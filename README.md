@@ -74,7 +74,10 @@ python -m pedestal_subtract --help
 | `--n_std_to_mask` | `1.5` | Sigma-clip width when estimating the pedestal. |
 | `--pedestal_subtraction_axis` | `row` | `row`, `col`, `row_then_col`, or `col_then_row`. |
 | `--use_overscan_only [EXT ...]` | off | Estimate the per-row pedestal from the overscan columns only (then subtract it from the full frame). Pass extension numbers (1–4) to apply to only those extensions, or the flag alone to apply to all; in the JSON config use `true`/`false` or a list like `[1, 3]`. Use `--no-use_overscan_only` to force it off. |
-| `--overscan_cols START STOP` | `-147 :` (last 147 cols) | Column slice the pedestal is estimated from when `--use_overscan_only` is set. Negative endpoints count from the right; in the JSON config use `null` for an open-ended slice (e.g. `[-147, null]`). |
+| `--overscan_cols START STOP` | from header | Column slice the pedestal is estimated from when `--use_overscan_only` is set. By default the overscan columns are computed from the FITS header (see below); this flag/config value is only used as a fallback when the header lacks the geometry keys. Negative endpoints count from the right; in the JSON config use `null` for an open-ended slice (e.g. `[-147, null]`). |
+| `--zero_one_n_bins` | `100` | Number of bins spanning the zero/one fit window at window scale 1.0 (the count scales up automatically when the window is widened, keeping bin width constant). Integer ≥ 10. |
+| `--zero_one_window_left_scale` | `1.0` | Scale the left half-width of the auto-computed zero/one fit window (≥ 1.0; > 1 widens toward lower charge). |
+| `--zero_one_window_right_scale` | `1.0` | Scale the right half-width of the auto-computed zero/one fit window (≥ 1.0; > 1 widens past the one-electron peak). |
 | `--force_pedsub` | off | Recompute, ignoring the on-disk cache. |
 | `--pedsub_cache_dir DIR` | source dir | Where to write the `*.pedsub.fits` cache. |
 | `-z` / `--plot_zero_one_adu` | on | Plot fits in ADU. |
@@ -86,6 +89,24 @@ python -m pedestal_subtract --help
 When saving to disk, each run is stored in a unique subfolder named with a short
 hash of the analysis-relevant config. The complete resolved config is also
 written to `config.json` inside that folder for reproducibility.
+
+### Overscan columns from the FITS header
+
+When `--use_overscan_only` is set, the serial-overscan column slice is computed
+directly from the CCD-geometry header keys rather than hard-coded. The detector
+has `PRESCAN` inactive columns, then `PHYSCOL` physical columns, then the overscan;
+a frame reads CCD columns `[NCOLPRE*NSBIN, (NCOL+NCOLPRE)*NSBIN]`, so the overscan
+is every column past `PRESCAN + PHYSCOL`. In binned image columns that is the last
+
+```
+n = ((NCOL + NCOLPRE) * NSBIN - (PRESCAN + PHYSCOL)) // NSBIN
+```
+
+columns, i.e. the slice `(-n, None)`. The required keys are `PRESCAN`, `PHYSCOL`,
+`NCOL`, `NCOLPRE`, and `NSBIN` (read from the first HDU that contains them). If any
+key is missing, the pipeline falls back to the `--overscan_cols` flag / `overscan_cols`
+config value. The helpers `get_fits_header` and `overscan_cols_from_header` are also
+exported for library use.
 
 ## Config compatibility with `nonlinearity_studies`
 
@@ -103,6 +124,7 @@ as in `nonlinearity_studies`. The keys this package consumes:
 
 `file_string`, `do_pedestal_subtraction`, `n_std_to_mask`, `pedestal_subtraction_axis`,
 `use_overscan_only`, `overscan_cols`,
+`zero_one_n_bins`, `zero_one_window_left_scale`, `zero_one_window_right_scale`,
 `pedsub_cache_dir`, `force_pedsub`, `use_biweight_loc`, `use_biweight_midvar`,
 `plot_zero_one_adu`, `plot_zero_one_electrons`, `plot_zero_one_individual`,
 `plot_zero_one_together`, `plot_zero_one_yscale`, `plot_zero_one_individual_figsize`,

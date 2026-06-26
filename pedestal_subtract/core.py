@@ -983,6 +983,49 @@ def get_fits(file_input):
 
     return ext_charge
 
+# CCD-geometry header keys used to locate the serial overscan columns.
+_OVERSCAN_HEADER_KEYS = ('PRESCAN', 'PHYSCOL', 'NCOL', 'NCOLPRE', 'NSBIN')
+
+def get_fits_header(file_input):
+    """Return the first FITS header (primary or extension) that carries the CCD
+    geometry keys in `_OVERSCAN_HEADER_KEYS`, or the primary header if none do."""
+    file_path = Path(file_input).resolve()
+    if not file_path.exists():
+        raise FileNotFoundError(f"FITS file not found: {file_path}")
+    with fits.open(str(file_path)) as hdu_list:
+        for hdu in hdu_list:
+            if all(k in hdu.header for k in _OVERSCAN_HEADER_KEYS):
+                return hdu.header
+        return hdu_list[0].header
+
+def overscan_cols_from_header(header):
+    """Compute the serial-overscan column slice ``(c0, c1)`` from CCD geometry keys.
+
+    The CCD has PRESCAN inactive columns, then PHYSCOL physical columns, then the
+    overscan. A frame reads CCD columns ``[NCOLPRE*NSBIN, (NCOL+NCOLPRE)*NSBIN]``,
+    so the overscan is every CCD column past ``PRESCAN + PHYSCOL``. Dividing that
+    CCD-column count by NSBIN converts it to *binned image* columns, giving the
+    last ``n = ((NCOL+NCOLPRE)*NSBIN - (PRESCAN+PHYSCOL)) // NSBIN`` columns of the
+    image (for NSBIN=1 this is just the CCD-column count).
+
+    Returns ``(-n, None)`` (a half-open slice selecting the last ``n`` columns),
+    or ``None`` if a required key is missing or the computed count is not positive.
+    """
+    if header is None or not all(k in header for k in _OVERSCAN_HEADER_KEYS):
+        return None
+    prescan = int(header['PRESCAN'])
+    physcol = int(header['PHYSCOL'])
+    ncol = int(header['NCOL'])
+    ncolpre = int(header['NCOLPRE'])
+    nsbin = int(header['NSBIN'])
+    if nsbin <= 0:
+        return None
+    n_overscan_ccd = (ncol + ncolpre) * nsbin - (prescan + physcol)
+    n_overscan = n_overscan_ccd // nsbin  # CCD columns -> binned image columns
+    if n_overscan <= 0:
+        return None
+    return (-n_overscan, None)
+
 #---------------- Per-extension zero/one fitting ----------------------------
 
 def _value_for_extension(value, ext, n_ext):
