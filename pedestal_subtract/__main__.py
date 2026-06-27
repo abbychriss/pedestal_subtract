@@ -15,23 +15,30 @@ command-line flags override config values, which override built-in defaults.
 """
 
 import argparse
+import glob
 import hashlib
 import inspect
 import json
 import sys
 from datetime import datetime
+
+import numpy as np
 from pathlib import Path
 
 from . import __version__
 from .core import (
     _PEDSUB_ALGO_VERSION,
+    _PEAKFIND_DENSITY,
     get_fits,
     get_fits_header,
     overscan_cols_from_header,
     pedestal_subtract_ext_cached,
     get_zero_one_peaks_ext,
+    _scalar_for_extension,
     plot_zero_one_peaks,
+    write_extension_summary_csv,
 )
+from .stitch_fits import stitch_fits
 
 
 # Default serial-overscan column range (Python half-open slice) used to estimate
@@ -60,6 +67,122 @@ def _overscan_ext_indices(value, n_ext):
             return set(range(n_ext))
         return {int(e) - 1 for e in value if 1 <= int(e) <= n_ext}
     return set(range(n_ext))                       # any other truthy scalar -> all
+
+
+def _coerce_fit_cols(value):
+    """Coerce a raw --fit_cols / config value into None, a [c0, c1] pair, or a list of
+    per-extension None/[c0, c1] entries.
+
+    The CLI passes a flat list of ints -- two (one range for every extension) or two per
+    extension (e.g. 8 for 4 extensions) -- while a JSON config may instead give a single
+    [c0, c1] pair or a per-extension list whose entries are [c0, c1] or null. A flat,
+    even-length int list is grouped into pairs here so both forms feed
+    ``_normalize_fit_cols`` identically. Raises ``ValueError`` on an odd int count.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)) and value and all(
+            isinstance(v, (int, np.integer)) for v in value):
+        if len(value) % 2 != 0:
+            raise ValueError(
+                f'--fit_cols needs an even number of integers (START STOP per extension); '
+                f'got {len(value)}')
+        pairs = [[int(value[i]), int(value[i + 1])] for i in range(0, len(value), 2)]
+        return pairs[0] if len(pairs) == 1 else pairs
+    return value
+
+
+def _coerce_gain_guess(value):
+    """Coerce a raw --zero_one_gain_guess / config value into None, a single float, or a
+    per-extension list of floats/None.
+
+    The CLI passes a list of floats (``nargs='+'``): one value (a single guess for every
+    extension) collapses to a scalar here, while several values are a per-extension list.
+    A JSON config may instead give a single number or a per-extension list whose entries
+    are numbers or null (null = auto-detect that extension). Returned unchanged otherwise.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            return value[0]
+        return list(value)
+    return value
+
+
+def _normalize_fit_cols(fit_cols, n_ext):
+    """Resolve fit_cols into one ``(c0, c1)``-or-None entry per extension.
+
+    Accepts ``None`` (all columns everywhere), a single ``(c0, c1)`` pair (applied to
+    every extension), or a length-``n_ext`` list whose entries are each ``None`` (all
+    columns for that extension) or a ``(c0, c1)`` pair. Mirrors
+    ``core._normalize_overscan_cols_ext``.
+    """
+    if fit_cols is None:
+        return [None] * n_ext
+    # Explicit per-extension list (checked first so an n_ext-extension file isn't mistaken
+    # for a single range): every entry must be None or a 2-sequence.
+    if isinstance(fit_cols, (list, tuple)) and len(fit_cols) == n_ext and all(
+            o is None or (isinstance(o, (list, tuple)) and len(o) == 2) for o in fit_cols):
+        return [tuple(o) if o is not None else None for o in fit_cols]
+    # A single (c0, c1) range -> apply to every extension.
+    if isinstance(fit_cols, (list, tuple)) and len(fit_cols) == 2 and all(
+            v is None or isinstance(v, (int, np.integer)) for v in fit_cols):
+        return [tuple(fit_cols)] * n_ext
+    raise ValueError(
+        f'fit_cols must be null, a [START, STOP] pair, or a length-{n_ext} list of '
+        f'null/[START, STOP]; got {fit_cols!r}')
+
+
+def _derive_data_path(file_path_str):
+    """
+    Derive the data path from the file path.
+
+    Args:
+        file_path_str: The file path string (can contain glob patterns like '*')
+
+    Returns:
+        tuple: (directory_path, image_pattern) where directory_path is the path to search
+               and image_pattern is the file pattern to match
+    """
+    # Remove trailing slashes
+    clean_path_str = file_path_str.rstrip('/')
+
+    # Split path and extract the image pattern (last component)
+    parts = clean_path_str.split('/')
+    image_pattern = parts[-1]  # e.g., '*' or '*.fz'
+
+    # Directory path is everything before the pattern
+    directory_path = '/'.join(parts[:-1])  # e.g., 'examples/images/ten-images'
+
+    # Convert to Path and make absolute if relative
+    dir_path = Path(directory_path)
+    if not dir_path.is_absolute():
+        dir_path = Path.cwd() / dir_path
+
+    return dir_path, image_pattern
+
+
+def _wildcard_free_base(pattern_str):
+    """Deepest leading directory of ``pattern_str`` that contains no glob wildcard.
+
+    When the file pattern spans multiple directories (e.g. ``.../PD07*/cds_avg*.fz``),
+    the stitched output must be anchored somewhere deterministic rather than inside a
+    literal wildcard-named folder (the old ``out_path`` reused ``PD07*`` verbatim, which
+    created an actual directory called ``PD07*``). This walks the leading path segments
+    up to the first one containing a glob magic character, so a concrete single
+    directory still gets its own ``stitched-fits`` subfolder, while a wildcard pattern
+    falls back to the common parent above the wildcard. Always returns an absolute path.
+    """
+    base_parts = []
+    for part in Path(pattern_str).parts:
+        if glob.has_magic(part):
+            break
+        base_parts.append(part)
+    base = Path(*base_parts) if base_parts else Path('.')
+    if not base.is_absolute():
+        base = Path.cwd() / base
+    return base
 
 
 def _load_config(path):
@@ -93,10 +216,20 @@ def _n_bins(value):
     return f
 
 
+def _peakfind_density(value):
+    """argparse type for the peak-finding histogram density (bins per ADU): a
+    number >= 1, used only to locate the zero/one peaks, independent of the
+    fit/plot bin count set by --zero_one_n_bins."""
+    f = float(value)
+    if f < 1.0:
+        raise argparse.ArgumentTypeError(f"must be >= 1 (got {f})")
+    return f
+
+
 # Args that should NOT influence the run-identity hash: anything that only
 # affects display/output (not the pedestal-subtracted data or the fit results).
 _RUN_HASH_EXCLUDE = {
-    'config', 'json', 'verbose', 'save_plots', 'output_dir', 'show_plots',
+    'config', 'json', 'verbose', 'save_plots', 'save_csv', 'output_dir', 'show_plots',
     'pedsub_cache_dir', 'force_pedsub',
     'extra_plot_title', 'nimages',
     'plot_zero_one_adu', 'plot_zero_one_electrons',
@@ -104,6 +237,7 @@ _RUN_HASH_EXCLUDE = {
     'plot_zero_one_yscale', 'plot_zero_one_xlim', 'plot_zero_one_ylim',
     'plot_zero_one_individual_figsize', 'plot_zero_one_subplots_figsize',
     'plot_zero_one_sharex', 'plot_zero_one_sharey', 'show_titles',
+    'electron_fit_mode',
 }
 
 
@@ -115,6 +249,7 @@ _PLOT_ARG_TO_PARAM = {
     'plot_zero_one_individual_figsize': 'individual_figsize',
     'plot_zero_one_subplots_figsize': 'subplots_figsize',
     'plot_zero_one_yscale': 'yscale',
+    'electron_fit_mode': 'electron_fit_mode',
     'plot_zero_one_individual': 'plot_individual',
     'plot_zero_one_together': 'plot_together',
     'plot_zero_one_sharex': 'sharex',
@@ -175,7 +310,18 @@ def init_argparse(argv=None):
                         help="Path to a JSON config file supplying argument defaults.")
     parser.add_argument("file_string", type=str, nargs='?',
                         default=_config_default(config, 'file_string', None),
-                        help="Path to the input FITS file (or set 'file_string' in the JSON config).")
+                        help="Path to the input FITS file, or to a directory with per-image "
+                             "FITS files (optionally with a glob pattern, e.g. "
+                             "data/03-12-2026/avg*.fz) when --stitch_fits is set. "
+                             "May also be set in the JSON config via 'file_string'.")
+
+    # ----- Stitching -----
+    parser.add_argument("-f", "--stitch_fits", action="store_true",
+                        default=_config_default(config, 'stitch_fits', False),
+                        help="Stitch the per-image FITS files matched by file_string into a "
+                             "single combined FITS (by extension), then analyze that.")
+    parser.add_argument("--no-stitch_fits", dest="stitch_fits", action="store_false",
+                        help="Disable FITS stitching when enabled by the JSON config.")
 
     # ----- Pedestal subtraction -----
     parser.add_argument("--do_pedestal_subtraction", action="store_true",
@@ -247,6 +393,34 @@ def init_argparse(argv=None):
                         default=_config_default(config, 'zero_one_window_right_scale', 1.0),
                         help="Scale the right half-width of the auto-computed zero/one fit "
                              "window (>=1.0; >1 widens past the one-electron peak). Default 1.0.")
+    parser.add_argument("--zero_one_peakfind_density", type=_peakfind_density,
+                        default=_config_default(config, 'zero_one_peakfind_density', _PEAKFIND_DENSITY),
+                        help="Bins-per-ADU of the internal histograms used to LOCATE the zero/one "
+                             "peaks (separate from --zero_one_n_bins, which sets the fit/plot bins). "
+                             "Raise for finer detection, lower to aggregate sparse low-statistics "
+                             f"hits. Number >= 1. Default {_PEAKFIND_DENSITY}.")
+    parser.add_argument("--fit_cols", nargs='+', type=int,
+                        default=_config_default(config, 'fit_cols', None),
+                        metavar='COL',
+                        help="Restrict the zero/one fit (and the plotted histograms) to image "
+                             "columns (a Python half-open slice START:STOP). Pass two ints "
+                             "(START STOP) to apply one range to every extension, or two per "
+                             "extension (e.g. 8 ints for 4 extensions) for per-extension ranges. "
+                             "Negative endpoints count from the right. Applied after pedestal "
+                             "subtraction, so the pedestal still uses the full frame/overscan. Omit "
+                             "to use all columns. In the JSON config use a [START, STOP] pair, or a "
+                             "per-extension list of [START, STOP]/null (null = all columns for that "
+                             "extension; null endpoints like [256, null] give an open-ended slice).")
+    parser.add_argument("--zero_one_gain_guess", nargs='+', type=float,
+                        default=_config_default(config, 'zero_one_gain_guess', None),
+                        metavar='GAIN',
+                        help="Seed for the one-electron peak location -- a guess for the gain "
+                             "(ADU/e-) -- used to initialize the double-Gaussian fit instead of "
+                             "auto-detecting the one-electron bump. Pass one value to apply it to "
+                             "every extension, or one per extension (e.g. 4 values for 4 "
+                             "extensions). In the JSON config use a single number or a "
+                             "per-extension list of numbers/null (null = auto-detect that "
+                             "extension). Omit to auto-detect for all. Values must be > 0.")
 
     # ----- Plotting -----
     parser.add_argument("-z", "--plot_zero_one_adu", action="store_true",
@@ -259,6 +433,13 @@ def init_argparse(argv=None):
                         help="Also produce the electron-units version of the fits.")
     parser.add_argument("--no-plot_zero_one_electrons", dest="plot_zero_one_electrons",
                         action="store_false", help="Disable the electron-units plot.")
+    parser.add_argument("--electron_fit_mode", type=str, choices=['transform', 'refit'],
+                        default=_config_default(config, 'electron_fit_mode', None),
+                        help="How to obtain the electron-unit double-Gaussian curve: "
+                             "'transform' (default) analytically rescales the converged ADU fit "
+                             "(exact; mu_0=0 / mu_1=1 by construction, no refit); 'refit' fits "
+                             "the double Gaussian again directly to the electron-unit histogram, "
+                             "letting the peaks/widths re-optimise in electron space.")
     # Display-only options below default to None when unset (no CLI flag, not in config)
     # so plot_zero_one_peaks's signature defaults stay the single source of truth; main()
     # forwards only the ones that were actually set.
@@ -325,6 +506,12 @@ def init_argparse(argv=None):
     parser.add_argument("-s", "--save_plots", action="store_true",
                         default=_config_default(config, 'save_plots', False),
                         help="Save plots to the output directory.")
+    parser.add_argument("--save_csv", action="store_true",
+                        default=_config_default(config, 'save_csv', False),
+                        help="Save a per-extension gain/noise summary as "
+                             "extension_summary.csv in the output directory.")
+    parser.add_argument("--no-save_csv", dest="save_csv", action="store_false",
+                        help="Do not write the extension_summary.csv file.")
     parser.add_argument("--show_plots", action="store_true",
                         default=_config_default(config, 'show_plots', True),
                         help="Display plots interactively.")
@@ -358,6 +545,30 @@ def init_argparse(argv=None):
     if int(args.zero_one_n_bins) < 10:
         parser.error(f"zero_one_n_bins must be an integer >= 10 (got {args.zero_one_n_bins})")
     args.zero_one_n_bins = int(args.zero_one_n_bins)
+    if float(args.zero_one_peakfind_density) < 1.0:
+        parser.error(f"zero_one_peakfind_density must be >= 1 (got {args.zero_one_peakfind_density})")
+    args.zero_one_peakfind_density = float(args.zero_one_peakfind_density)
+
+    # argparse's choices only validate CLI strings, so re-check a config-supplied value.
+    if args.electron_fit_mode not in (None, 'transform', 'refit'):
+        parser.error(f"electron_fit_mode must be 'transform' or 'refit' (got {args.electron_fit_mode!r})")
+
+    # Group a flat CLI int list into column pairs (and validate the count) up front, so
+    # the stored/snapshotted value is the canonical pair / per-extension form.
+    try:
+        args.fit_cols = _coerce_fit_cols(args.fit_cols)
+    except ValueError as e:
+        parser.error(str(e))
+
+    # Collapse a single gain seed to a scalar (per-extension list otherwise) and check
+    # every supplied value is positive -- the gain (ADU/e-) is always > 0. argparse's
+    # `type` only validates CLI floats, so the per-entry check also covers config values.
+    args.zero_one_gain_guess = _coerce_gain_guess(args.zero_one_gain_guess)
+    _gg = args.zero_one_gain_guess
+    _gg_values = _gg if isinstance(_gg, list) else ([] if _gg is None else [_gg])
+    for v in _gg_values:
+        if v is not None and float(v) <= 0:
+            parser.error(f"zero_one_gain_guess values must be > 0 (got {v})")
 
     return args
 
@@ -373,17 +584,58 @@ def main(argv=None):
         sys.exit(1)
 
     file_path = Path(args.file_string)
-    if not file_path.is_absolute() and not file_path.exists():
-        # Search the current tree for a matching filename.
-        for found in Path('.').rglob(file_path.name):
-            file_path = found
-            break
 
-    if not file_path.exists():
-        print(f'Error: FITS file not found: {args.file_string}')
-        sys.exit(1)
+    # When not stitching, file_string must resolve to an existing FITS file (with a
+    # tree-wide search fallback for a bare relative name). When stitching, file_string is
+    # instead a directory / glob of per-image FITS files, so this check is skipped.
+    if not args.stitch_fits:
+        if not file_path.is_absolute() and not file_path.exists():
+            # Search the current tree for a matching filename.
+            for found in Path('.').rglob(file_path.name):
+                file_path = found
+                break
 
-    default_fig_path = file_path.parent / 'plots'
+        if not file_path.exists():
+            print(f'Error: FITS file not found: {args.file_string}')
+            sys.exit(1)
+
+    # Optionally stitch the per-image FITS files into a single combined FITS, then analyze
+    # that. If file_string already points inside a 'stitched-fits' directory, reuse the
+    # existing stitched file instead of re-stitching.
+    stitched_dir_name = 'stitched-fits'
+    if args.stitch_fits:
+        input_dir, input_pattern = _derive_data_path(args.file_string)
+
+        if stitched_dir_name in input_dir.parts:
+            stitched_match = next(input_dir.glob(input_pattern), None)
+            if stitched_match is None:
+                print('\nError: no files found matching the specified stitched FITS pattern.')
+                sys.exit(1)
+            file_path = stitched_match
+        else:
+            # Anchor the output at the deepest wildcard-free directory of the pattern, so a
+            # multi-directory glob (e.g. PD07*/...) writes one combined file to a single
+            # 'stitched-fits' folder instead of a literal 'PD07*' directory. out_path is
+            # absolute, so it overrides stitch_fits's own file_path/out_path join.
+            out_path = (_wildcard_free_base(args.file_string) / stitched_dir_name).resolve()
+            stitched_file = stitch_fits(
+                input_dir.parent,
+                directory=input_dir.name,
+                image=input_pattern,
+                out_path=out_path,
+                print_header=args.verbose,
+            )
+            if stitched_file is None:
+                sys.exit(1)
+            file_path = Path(stitched_file)
+
+    # Plots live next to the source image, or beside the 'stitched-fits' parent when stitched.
+    if stitched_dir_name in file_path.parts:
+        stitched_fits_idx = file_path.parts.index(stitched_dir_name)
+        base_path = Path(*file_path.parts[:stitched_fits_idx])
+        default_fig_path = base_path / 'plots'
+    else:
+        default_fig_path = file_path.parent / 'plots'
     fig_path = Path(args.output_dir) if args.output_dir else default_fig_path
 
     # Hardcoded parameters that affect the fit results (not display). Defined here
@@ -394,6 +646,8 @@ def main(argv=None):
         'zero_one_test_range': 'auto',
         'window_left_scale': args.zero_one_window_left_scale,
         'window_right_scale': args.zero_one_window_right_scale,
+        'peakfind_density': args.zero_one_peakfind_density,
+        'gain_seed': args.zero_one_gain_guess,
     }
 
     run_hash = _run_hash(args)
@@ -402,7 +656,7 @@ def main(argv=None):
 
     # Only materialize the run directory (and its config snapshot) when there is
     # something to save into it; interactive-only runs leave no directory behind.
-    if args.save_plots:
+    if args.save_plots or args.save_csv:
         fig_path.mkdir(parents=True, exist_ok=True)
         config_snapshot_path = fig_path / 'config.json'
         snapshot = {
@@ -416,7 +670,8 @@ def main(argv=None):
         with open(config_snapshot_path, 'w', encoding='utf-8') as f:
             json.dump(snapshot, f, indent=2, sort_keys=True, default=str)
         print(f'Config snapshot saved to {config_snapshot_path}')
-        print(f'Plots will be saved to {fig_path}')
+        if args.save_plots:
+            print(f'Plots will be saved to {fig_path}')
 
     print(f'Analyzing image: {file_path}\n')
     data_ext = get_fits(str(file_path))
@@ -456,12 +711,33 @@ def main(argv=None):
             overscan_cols=overscan_cols,
         )
 
+    # Restrict the columns used for the zero/one fit (and the plotted histograms), if
+    # configured. Done after pedestal subtraction so the per-row pedestal (and any
+    # overscan estimate) still sees the full frame. The fit flattens each extension, so
+    # this only changes which pixels enter the zero/one histogram, not the geometry.
+    # One (c0, c1) range may be applied to every extension, or one per extension.
+    fit_cols_ext = _normalize_fit_cols(args.fit_cols, len(data_ext))
+    if any(fc is not None for fc in fit_cols_ext):
+        data_ext = [
+            np.asarray(d)[:, fc[0]:fc[1]] if fc is not None else d
+            for d, fc in zip(data_ext, fit_cols_ext)
+        ]
+        if args.verbose:
+            print(f'Restricting the fit columns per extension: {fit_cols_ext}')
+
     # Infer the stitched-image count from the filename unless overridden.
     nimages = args.nimages
     if nimages is None:
         import re
         match = re.search(r'_(\d+)_stitched', str(file_path))
         nimages = int(match.group(1)) if match else 1
+
+    if args.verbose and fit_params['gain_seed'] is not None:
+        # Show the per-extension gain seeds actually applied (resolved with the same
+        # helper the fit uses), so a single value is reported as the list it broadcasts to.
+        gain_seeds_ext = [_scalar_for_extension(fit_params['gain_seed'], ext, len(data_ext))
+                          for ext in range(len(data_ext))]
+        print(f'Using guess for gains: {gain_seeds_ext}')
 
     (zero_one_counts_ext, zero_one_edges_ext, pedestals, gains,
      double_gauss_popts, zero_one_ranges) = get_zero_one_peaks_ext(
@@ -471,13 +747,25 @@ def main(argv=None):
         zero_one_test_range=fit_params['zero_one_test_range'],
         window_left_scale=fit_params['window_left_scale'],
         window_right_scale=fit_params['window_right_scale'],
+        peakfind_density=fit_params['peakfind_density'],
+        gain_seed=fit_params['gain_seed'],
     )
 
     for ext, (pedestal, gain) in enumerate(zip(pedestals, gains)):
         noise = double_gauss_popts[ext][0]
-        print(f'EXT {ext + 1}: pedestal = {pedestal:.4f} ADU, '
-              f'noise = {noise/gain:.4f} e-, gain = {gain:.4f} ADU/e-')
+        if np.isnan(gain):
+            # No trustworthy one-electron peak: gain (hence noise in e-) is undefined.
+            print(f'EXT {ext + 1}: pedestal = {pedestal:.4f} ADU, '
+                  f'noise = {noise:.4f} ADU, no 1 e- peak found (gain undefined)')
+        else:
+            print(f'EXT {ext + 1}: pedestal = {pedestal:.4f} ADU, '
+                  f'noise = {noise/gain:.4f} e-, gain = {gain:.4f} ADU/e-')
     print()
+
+    if args.save_csv:
+        summary_csv_path = fig_path / 'extension_summary.csv'
+        write_extension_summary_csv(summary_csv_path, gains, double_gauss_popts)
+        print(f'Saved per-extension summary to {summary_csv_path}\n')
 
     if args.plot_zero_one_adu or args.plot_zero_one_electrons:
         # Forward only the display options the user/config actually set (non-None); the rest

@@ -9,6 +9,8 @@ the pieces needed to:
   4. Plot those double-Gaussian fits in ADU and/or electron units.
 """
 
+import csv
+
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
@@ -47,15 +49,32 @@ def _smooth_counts(counts, window=5):
     kernel = np.ones(window) / window
     return np.convolve(counts, kernel, mode='same')
 
-# Bins-per-ADU used only for the internal peak-finding histograms (locating the
-# zero/one peaks and estimating their widths). These need fine resolution and are
-# kept independent of the user-facing `n` (which sets the fit-window bin count),
-# so lowering `n` does not degrade peak detection.
-_PEAKFIND_DENSITY = 100
+# Default bins-per-ADU for the internal peak-finding histograms (locating the
+# zero/one peaks and estimating their widths). Kept independent of the user-facing
+# `n` (which sets the fit-window bin count) so lowering `n` does not degrade peak
+# detection; exposed as the `peakfind_density` parameter / `zero_one_peakfind_density`
+# config key so it can be tuned separately for low-statistics images. Coarser bins
+# (a low density) aggregate sparse single-electron hits into a detectable cluster,
+# so the default is deliberately low. Note `_peakfind_bins` floors the histogram at
+# 50 bins, so any density small enough to fall below that floor behaves identically.
+_PEAKFIND_DENSITY = 10
 
-def _peakfind_bins(hist_range):
+# Physically allowed range for the gain (ADU/e-). The gain converts ADU to
+# electrons and is always > 1, and here we further cap it: the one-electron peak
+# must sit in [pedestal + _MIN_GAIN_ADU, pedestal + _MAX_GAIN_ADU]. This band is
+# used both to constrain the fit's mu_1 and to reject implausible fits. Kept as
+# module constants so they are easy to tune; promote to config options if needed.
+_MIN_GAIN_ADU = 0.5
+_MAX_GAIN_ADU = 1.5
+# Extra headroom (ADU) the fit is allowed *above* the gain band's upper edge, so a
+# feature beyond the cap is fit at its true (high) centre and then rejected, rather
+# than pinning at 1.5 and passing. The lower edge stays hard (the gain is always
+# > 1). Acceptance still uses the band [_MIN_GAIN_ADU, _MAX_GAIN_ADU].
+_GAIN_FIT_MARGIN = 0.3
+
+def _peakfind_bins(hist_range, density=_PEAKFIND_DENSITY):
     left, right = hist_range
-    return min(4000, max(50, int(_PEAKFIND_DENSITY * (right - left))))
+    return min(4000, max(50, int(density * (right - left))))
 
 def _make_histogram(data, hist_range, n, max_bins=4000):
     left, right = hist_range
@@ -125,7 +144,8 @@ def _clip_to_bounds(values, bounds):
     eps = np.maximum(1e-12, 1e-9 * np.maximum(1, np.abs(high - low)))
     return np.minimum(np.maximum(values, low + eps), high - eps)
 
-def _auto_zero_one_setup(data, zero_one_test_range, n, window_left_scale=1.0, window_right_scale=1.0):
+def _auto_zero_one_setup(data, zero_one_test_range, n, window_left_scale=1.0, window_right_scale=1.0,
+                         peakfind_density=_PEAKFIND_DENSITY, gain_seed=None):
     use_auto_range = (
         zero_one_test_range is None
         or (isinstance(zero_one_test_range, str) and zero_one_test_range in ('auto', 'default'))
@@ -154,7 +174,8 @@ def _auto_zero_one_setup(data, zero_one_test_range, n, window_left_scale=1.0, wi
         range_left, range_right = zero_one_test_range
 
     test_range = (range_left, range_right)
-    _, counts_test, edges_test, centers_test = _make_histogram(data, test_range, _peakfind_bins(test_range))
+    _, counts_test, edges_test, centers_test = _make_histogram(
+        data, test_range, _peakfind_bins(test_range, peakfind_density))
 
     if max(counts_test) == 0:
         raise ValueError(
@@ -169,45 +190,81 @@ def _auto_zero_one_setup(data, zero_one_test_range, n, window_left_scale=1.0, wi
     bin_width = centers_test[1] - centers_test[0]
     zero_peak_width = max(zero_peak_width, bin_width)
 
+    one_lo = zero_peak_charge + _MIN_GAIN_ADU
+    one_hi = zero_peak_charge + _MAX_GAIN_ADU
     search_left = zero_peak_charge - 5 * zero_peak_width
-    search_right = zero_peak_charge + max(20 * zero_peak_width, 2 * (range_right - zero_peak_charge))
-
-    data_high = np.percentile(data, 99)
-    if np.isfinite(data_high):
-        search_right = min(search_right, data_high)
-
-    if search_right <= zero_peak_charge:
-        search_right = zero_peak_charge + 20 * zero_peak_width
+    search_right = one_hi + 3 * zero_peak_width
 
     search_range = (search_left, search_right)
-    _, search_counts, search_edges, search_centers = _make_histogram(data, search_range, _peakfind_bins(search_range))
-    smooth_search = _smooth_counts(search_counts, window=9)
+    _, search_counts, search_edges, search_centers = _make_histogram(
+        data, search_range, _peakfind_bins(search_range, peakfind_density))
     search_bin_width = search_centers[1] - search_centers[0]
+    # Smooth on the scale of the zero-peak width rather than re-binning coarsely.
+    # In a low-statistics image the single-electron hits are sparse 1-count bins,
+    # so on the raw fine histogram they never form a bump; averaging over ~one
+    # zero-peak width lets a real cluster aggregate into a detectable peak while a
+    # smooth monotonic tail stays bump-free. With coarse bins (low peakfind_density)
+    # the bins already aggregate, so keep the smoothing window small -- a large
+    # floor would wash a narrow one-electron bump (especially a low-gain one) into a
+    # flat plateau that find_peaks can no longer locate.
+    smooth_window = max(3, int(round(zero_peak_width / search_bin_width)))
+    smooth_search = _smooth_counts(search_counts, window=smooth_window)
     peak_distance = max(1, int(2 * zero_peak_width / search_bin_width))
-    peak_prominence = max(5, 0.002 * max(smooth_search))
+    # Reference the prominence to the Poisson noise of the *valley* level (a low
+    # percentile of the tail counts), not the median: the median is inflated by the
+    # bright zero-peak shoulder and the one-electron bump itself, pushing the
+    # threshold so high that a genuine weak bump is missed. A low percentile tracks
+    # the background between/around the peaks, so a real cluster clears it while
+    # isolated single-bin spikes (rejected by the width requirement) do not.
+    tail_mask = search_centers > (zero_peak_charge + 3 * zero_peak_width)
+    tail_counts = smooth_search[tail_mask]
+    tail_counts = tail_counts[tail_counts > 0]
+    tail_background = float(np.percentile(tail_counts, 25)) if tail_counts.size else 1.0
+    peak_prominence = max(2.0, 1.5 * np.sqrt(max(tail_background, 1.0)))
+    peak_min_width = max(1.0, 0.5 * zero_peak_width / search_bin_width)
     peak_indices, _ = scipy_find_peaks(
         smooth_search,
         prominence=peak_prominence,
         distance=peak_distance,
+        width=peak_min_width,
     )
 
-    one_peak_min_charge = zero_peak_charge + max(zero_peak_width, 0.2)
-    right_peak_indices = [
-        peak_index for peak_index in peak_indices
-        if search_centers[peak_index] > one_peak_min_charge
-    ]
+    # Seed mu_1 on the one-electron bump, ranking candidates by their *excess above
+    # the estimated zero-peak tail* rather than their raw counts. The bright but
+    # monotonic zero-peak shoulder can carry more absolute counts than a real bump
+    # sitting further out (especially with a small minimum gain, where the band's
+    # lower edge is still in the tail), so ranking by raw counts seeds on the
+    # shoulder; ranking by excess keeps it on the genuine bump. Prefer a detected
+    # local maximum (find_peaks); fall back to the largest-excess bin when none is
+    # found (a sparse or flat cluster find_peaks misses).
+    zero_height = smooth_search[np.argmin(np.abs(search_centers - zero_peak_charge))]
+    zero_tail_est = zero_height * np.exp(
+        -(search_centers - zero_peak_charge) ** 2 / (2 * zero_peak_width ** 2))
+    excess = smooth_search - zero_tail_est
 
-    if right_peak_indices:
+    band_peaks = [pi for pi in peak_indices if one_lo <= search_centers[pi] <= one_hi]
+    if band_peaks:
         found_one_peak = True
-        one_peak_index = max(right_peak_indices, key=lambda peak_index: smooth_search[peak_index])
-        one_peak_charge = search_centers[one_peak_index]
-        one_peak_height = smooth_search[one_peak_index]
+        seed_idx = max(band_peaks, key=lambda pi: excess[pi])
     else:
         found_one_peak = False
-        one_peak_charge = zero_peak_charge + 4 * zero_peak_width
-        one_peak_height = 0.1 * smooth_search[np.argmin(np.abs(search_centers - zero_peak_charge))]
+        band_idx = np.where((search_centers >= one_lo) & (search_centers <= one_hi))[0]
+        seed_idx = band_idx[np.argmax(excess[band_idx])]
+    one_peak_charge = search_centers[seed_idx]
+    one_peak_height = smooth_search[seed_idx]
 
-    gain_guess = max(one_peak_charge - zero_peak_charge, 4 * zero_peak_width)
+    # A user-supplied gain seed (a guess for the gain, ADU/e-) overrides the auto-
+    # detected bump location: place the one-electron seed at zero_peak + gain_seed and
+    # read its height off the histogram there. Everything downstream (the fit window
+    # width, mu_1's seed/bounds, the amplitude guess) then follows from this guessed
+    # gain. The post-fit acceptance band in calculate_noise_gain is unchanged, so a
+    # seed outside [_MIN_GAIN_ADU, _MAX_GAIN_ADU] still only nudges the starting point.
+    if gain_seed is not None:
+        one_peak_charge = zero_peak_charge + float(gain_seed)
+        seed_idx = int(np.argmin(np.abs(search_centers - one_peak_charge)))
+        one_peak_height = smooth_search[seed_idx]
+
+    gain_guess = one_peak_charge - zero_peak_charge  # within [_MIN_GAIN_ADU, _MAX_GAIN_ADU] when auto-detected
 
     left_halfwidth = max(4 * zero_peak_width, 0.5 * gain_guess)
     right_halfwidth = max(1.8 * gain_guess, 8 * zero_peak_width)
@@ -228,37 +285,61 @@ def _auto_zero_one_setup(data, zero_one_test_range, n, window_left_scale=1.0, wi
         raise ValueError(f'No data found in inferred zero-one range {zero_one_range}')
 
     fit_left, fit_right = zero_one_range
-    m0_margin = max(2 * zero_peak_width, 0.3 * gain_guess)
-    if found_one_peak:
-        m1_margin = max(0.02 * zero_peak_width, 0.5 * (zero_one_centers[1] - zero_one_centers[0]))
-        m1_low = max(
-            zero_peak_charge + max(zero_peak_width, 0.2 * gain_guess),
-            one_peak_charge - m1_margin,
-        )
-        m1_high = min(
-            fit_right,
-            zero_peak_charge + max(1.7 * gain_guess, 8 * zero_peak_width),
-            one_peak_charge + m1_margin,
-        )
-    else:
-        m1_low = zero_peak_charge + max(zero_peak_width, 0.2 * gain_guess)
-        m1_high = min(fit_right, zero_peak_charge + max(1.7 * gain_guess, 8 * zero_peak_width))
-
+    # The pedestal is robustly located (it is the bulk of the data), so keep mu_0
+    # on a short leash around the detected zero peak -- this too stops the zero
+    # Gaussian from drifting into the one-electron region.
+    m0_margin = max(0.5 * zero_peak_width, 2 * (zero_one_centers[1] - zero_one_centers[0]))
+    # Give the fit headroom past both edges of the gain band so a real peak near an
+    # edge is centred on its bump rather than pinned to it (a low-gain bump that
+    # sits just above the floor would otherwise pin at the floor and read as the
+    # minimum gain or be rejected). The lower headroom is floored at a few zero-peak
+    # widths off the pedestal, so on a wide zero peak -- where the band's lower edge
+    # is only a couple of sigma out -- the one-electron Gaussian still cannot slide
+    # back onto the zero-peak shoulder. Acceptance is restricted to the band
+    # [_MIN_GAIN_ADU, _MAX_GAIN_ADU] after the fit (in calculate_noise_gain).
+    # Also keep mu_1 within ~one zero-peak width below the detected/seeded bump, so
+    # the fit cannot slide down off the bump to mop up a heavy (non-Gaussian)
+    # zero-peak tail -- the failure on a low-gain bump sitting on a steep tail.
+    m1_low = max(one_lo - _GAIN_FIT_MARGIN, zero_peak_charge + 4 * zero_peak_width,
+                 one_peak_charge - zero_peak_width)
+    m1_high = min(fit_right, one_hi + _GAIN_FIT_MARGIN)
     if m1_high <= m1_low:
-        m1_high = fit_right
+        m1_high = min(fit_right, one_hi)
 
+    # Floor both widths at a fraction of the zero-peak width: a real peak cannot be
+    # narrower than the readout noise, so this stops curve_fit from collapsing
+    # either Gaussian into a delta spike on a single noisy bin (the low-statistics
+    # failure that otherwise yields a confident but bogus gain).
+    sigma_floor = max(0.3 * zero_peak_width, (zero_one_centers[1] - zero_one_centers[0]) / 10, 1e-8)
     fit_bounds_low = [
-        max((zero_one_centers[1] - zero_one_centers[0]) / 10, 1e-8),
+        sigma_floor,
         max(fit_left, zero_peak_charge - m0_margin),
-        max((zero_one_centers[1] - zero_one_centers[0]) / 10, 1e-8),
+        sigma_floor,
         m1_low,
         0,
         0,
     ]
     fit_bounds_high = [
-        max(gain_guess, 4 * zero_peak_width),
-        min(fit_right, zero_peak_charge + m0_margin),
-        max(1.5 * gain_guess, 6 * zero_peak_width),
+        # sigma_0 is the well-determined pedestal width; bound it tightly so the
+        # zero Gaussian cannot broaden to absorb the one-electron region (which
+        # would drag mu_1 -- and the gain -- low on a weak cluster).
+        2.0 * zero_peak_width,
+        max(fit_right, zero_peak_charge + m0_margin),
+        # sigma_1 (width of the one-electron peak) is comparable to the readout
+        # noise (~sigma_0), so cap it at the zero-peak width. This is deliberately
+        # tight: a looser bound lets curve_fit broaden the one-electron Gaussian
+        # into a shallow smear that mops up the zero-peak tail/shoulder instead of
+        # sitting on the bump, which both biases the gain and makes the fit fail on
+        # the clean peaks. (A genuinely broad, weak one-electron population sitting
+        # close to the pedestal -- as on a very narrow zero peak -- cannot be fit
+        # this way and is reported as no-peak; see the README.)
+        1.0 * zero_peak_width,
+        # mu_1's upper edge is the gain-band edge with headroom (m1_high, already
+        # capped at fit_right). Do NOT scale it: when the pedestal is not subtracted
+        # the zero peak sits at a (often negative) raw-ADU offset, so a multiplier
+        # like 5*m1_high pushes the "upper" bound further from zero than m1_low and
+        # inverts the bound (lower >= upper), which makes curve_fit raise. The post-
+        # fit acceptance band [_MIN_GAIN_ADU, _MAX_GAIN_ADU] already caps the gain.
         m1_high,
         2 * max_zero_one_counts,
         2 * max_zero_one_counts,
@@ -271,19 +352,83 @@ def _auto_zero_one_setup(data, zero_one_test_range, n, window_left_scale=1.0, wi
     p0 = [
         zero_peak_width,
         zero_peak_charge,
-        max(1.5 * zero_peak_width, gain_guess / 3),
+        max(zero_peak_width, sigma_floor),  # sigma_1 ~ readout noise (~sigma_0)
         one_peak_charge,
         max_zero_one_counts,
         one_peak_height,
     ]
     p0 = _clip_to_bounds(p0, fit_bounds)
 
-    return zero_one_counts, zero_one_edges, p0, fit_bounds, zero_one_range
+    return zero_one_counts, zero_one_edges, p0, fit_bounds, zero_one_range, found_one_peak
 
 #---------------- (1) Calculate noise / gain ----------------------------
 
+def _one_electron_peak_is_real(centers, counts, popt, zero_peak_width):
+    """Decide whether the fitted one-electron Gaussian is a genuine peak.
+
+    The discriminating feature of a real one-electron peak -- as opposed to the
+    fitter draping the second Gaussian over a heavy but *monotonic* tail of the
+    zero peak -- is that, once the fitted zero-electron Gaussian is subtracted, the
+    residual sits **higher in a band around mu_1 than in the valley between mu_1 and
+    the zero peak**, and that band carries a statistically significant excess of
+    pixels. A monotonic tail's residual only falls off with charge, so its "bump"
+    never rises above the material just inside it and it is rejected -- this is the
+    "is the second peak just inside the zero peak's envelope?" check.
+
+    A strict local maximum is deliberately *not* required: a very low-statistics
+    peak may be a few flat-topped bins of equal height, which `find_peaks` would
+    miss. Comparing a band around mu_1 to the inner valley accepts such a plateau
+    while still rejecting a featureless monotonic slope. The strength threshold is
+    kept lenient so a weak-but-real cluster (a genuine low gain near 1 e-) passes.
+    """
+    s0, m0, s1, m1, N0, N1 = (popt[0], popt[1], popt[2], popt[3], popt[4], popt[5])
+    centers = np.asarray(centers, dtype=float)
+    counts = np.asarray(counts, dtype=float)
+    bin_width = centers[1] - centers[0]
+    if bin_width <= 0:
+        return False
+
+    # Residual above the zero-electron Gaussian, smoothed on the zero-peak scale.
+    zero_model = N0 * np.exp(-(centers - m0) ** 2 / (2 * s0 ** 2))
+    resid = counts - zero_model
+    smooth_win = max(3, int(round(zero_peak_width / bin_width)))
+    resid_smooth = _smooth_counts(resid, window=smooth_win)
+
+    # A band around mu_1 (the candidate peak). Use the median over the band so a
+    # flat-topped low-statistics peak is treated the same as a sharp one.
+    half = max(s1, zero_peak_width)
+    band = (centers >= m1 - half) & (centers <= m1 + half)
+    if not np.any(band):
+        return False
+    band_level = float(np.median(resid_smooth[band]))
+
+    # Compare the band to the residual on the shoulder immediately *inside* it
+    # (toward the zero peak). A real peak turns up: the shoulder is the valley
+    # between the zero and one peaks, so it sits below the band. A monotonic tail
+    # of the zero peak only falls off, so its residual is still *higher* just inside
+    # the band than in it -> rejected. Measuring the level right at the inner
+    # shoulder (not the global minimum of a wide valley) is what catches a tail
+    # that is still sloping down as it passes through the band.
+    inner_lo = max(m0 + 2 * zero_peak_width, m1 - 2 * half)
+    inner = (centers >= inner_lo) & (centers < m1 - half)
+    inner_level = float(np.median(resid_smooth[inner])) if np.any(inner) else 0.0
+
+    # The band must rise above that inner shoulder (rejects monotonic tails) ...
+    if band_level <= inner_level:
+        return False
+
+    # ... and carry a significant integrated excess above the zero-peak envelope.
+    total = counts[band].sum()
+    background = zero_model[band].sum()
+    excess = total - background
+    if total <= 0:
+        return False
+    significance = excess / np.sqrt(total + 1.0)
+    return (excess >= 4.0) and (significance >= 3.0)
+
 def calculate_noise_gain(data, zero_one_test_range='auto', n=100, fit_bounds='default',
-                         window_left_scale=1.0, window_right_scale=1.0):
+                         window_left_scale=1.0, window_right_scale=1.0,
+                         peakfind_density=_PEAKFIND_DENSITY, gain_seed=None):
 
     data = np.array(data).flatten()
     data = data[np.isfinite(data)]
@@ -291,12 +436,14 @@ def calculate_noise_gain(data, zero_one_test_range='auto', n=100, fit_bounds='de
     if data.size == 0:
         raise ValueError('Input data contains no finite values')
 
-    zero_one_counts, zero_one_edges, p0, auto_fit_bounds, zero_one_range = _auto_zero_one_setup(
+    zero_one_counts, zero_one_edges, p0, auto_fit_bounds, zero_one_range, _found_one_peak = _auto_zero_one_setup(
         data,
         zero_one_test_range,
         n,
         window_left_scale=window_left_scale,
         window_right_scale=window_right_scale,
+        peakfind_density=peakfind_density,
+        gain_seed=gain_seed,
     )
     zero_one_centers = 0.5 * (zero_one_edges[:-1] + zero_one_edges[1:])
 
@@ -307,11 +454,29 @@ def calculate_noise_gain(data, zero_one_test_range='auto', n=100, fit_bounds='de
 
     popt, pcov = curve_fit(double_gauss, zero_one_centers, zero_one_counts, p0=p0,
                            maxfev=20000, bounds=fit_bounds)
-    
-    # Extract pedestal, noise, gain, and rest of double gaussian coefficients from curve fit
-    pedestal=tuple(popt)[1] # Pedestal is mean of zero electron peak
-    noise=tuple(popt)[0] # Noise is standard deviation of zero electron peak 
-    gain=tuple(popt)[3]-tuple(popt)[1] # Gain is difference between mean of one and zero electron peaks
+
+    # Extract pedestal, noise, and the double-Gaussian coefficients from the fit.
+    s0_fit, m0_fit, s1_fit, m1_fit, N0_fit, N1_fit = popt
+    pedestal = m0_fit  # Pedestal is mean of the zero-electron peak
+    noise = s0_fit     # Noise is the standard deviation of the zero-electron peak
+
+    # Decide whether the one-electron Gaussian is a real peak or just the fitter
+    # using the second Gaussian to absorb the (non-Gaussian) tail of the zero peak
+    # (see _one_electron_peak_is_real). "No peak" therefore fires only when there
+    # is genuinely no localized excess -- a real gain in the allowed band passes.
+    # The gain (ADU/e-) is physically always > 1, so a fitted separation outside
+    # [_MIN_GAIN_ADU, _MAX_GAIN_ADU] is rejected as not a real 0->1 step.
+    # #_one_electron_peak_is_real(zero_one_centers, zero_one_counts, popt, noise) \
+    gain_candidate = m1_fit - m0_fit
+    if _MIN_GAIN_ADU <= gain_candidate <= _MAX_GAIN_ADU:
+        gain = gain_candidate  # difference between the one- and zero-electron peak means
+    else:
+        # No trustworthy one-electron peak: gain is undefined. Return NaN and zero
+        # the one-electron amplitude so downstream plotting draws only the single
+        # (zero-electron) Gaussian.
+        gain = np.nan
+        popt = np.array([s0_fit, m0_fit, s1_fit, m1_fit, N0_fit, 0.0])
+
     return zero_one_counts, zero_one_edges, pedestal, noise, gain, popt, zero_one_range
 
 #---------------- (2) Pedestal subtraction ----------------------------
@@ -628,35 +793,71 @@ def _zero_one_ylim(ylim, yscale, counts, fit_y):
         return 0, max(np.max(counts), np.max(fit_y)) * 1.05
     return ylim[0], ylim[1]
 
-def _fit_double_gauss_electrons(centers_e, counts_e, double_gauss_popt, pedestal, gain, maxfev=5000):
-    """Fit the zero/one peak histogram in electron units, seeded from the converged ADU fit.
+def _double_gauss_popt_electrons(double_gauss_popt, pedestal, gain):
+    """Transform the converged ADU double-Gaussian fit into electron units.
 
-    The ADU fit already located both peaks, so converting it to electron units gives a
-    physically anchored initial guess (mu0 == 0, mu1 == 1 by construction, since
-    pedestal == popt[1] and gain == popt[3] - popt[1]) instead of refitting blind with
-    a fixed p0 of all-ones. Bounds are derived from that guess rather than hardcoded, so
-    the fit cannot collapse one Gaussian into a delta spike on a noise bump or slide the
-    one-electron peak onto the pedestal -- the failure mode seen on low-statistics single
-    images.
+    Converting charge to electrons, ``x_e = (x - pedestal) / gain``, is an exact
+    linear rescaling under which the double Gaussian maps term for term: the means
+    go to ``mu0_e = 0`` and ``mu1_e = 1`` (by construction, since ``pedestal == mu0``
+    and ``gain == mu1 - mu0``), the widths scale as ``sigma / gain``, and the
+    amplitudes are unchanged (the electron histogram uses the same bin count over
+    the rescaled range, so every bin holds the same pixels). The electron-unit curve
+    is therefore fully determined by the ADU fit.
+
+    We transform analytically rather than re-fitting in electron units: an
+    independent refit has nothing to gain (the answer is fixed by the transform) and
+    its free parameters only let curve_fit drift the one-electron peak off
+    ``mu_1 = 1`` and balloon ``sigma_1`` -- exactly the spurious wide/displaced
+    electron-space fit otherwise seen even when the ADU fit is clean.
     """
-    s0, m0, s1, m1 = (double_gauss_popt[0], double_gauss_popt[1],
-                      double_gauss_popt[2], double_gauss_popt[3])
-    s0_e = max(s0 / gain, 1e-3)
-    s1_e = max(s1 / gain, 1e-3)
-    m0_e = (m0 - pedestal) / gain   # 0 by construction
-    m1_e = (m1 - pedestal) / gain   # 1 by construction
+    s0, m0, s1, m1, N0, N1 = (double_gauss_popt[0], double_gauss_popt[1], double_gauss_popt[2],
+                              double_gauss_popt[3], double_gauss_popt[4], double_gauss_popt[5])
+    return np.array([s0 / gain, (m0 - pedestal) / gain, s1 / gain, (m1 - pedestal) / gain, N0, N1])
 
-    N0_0 = max(counts_e[np.argmin(np.abs(centers_e - m0_e))], 1.0)
-    N1_0 = max(counts_e[np.argmin(np.abs(centers_e - m1_e))], 1.0)
-    cmax = max(np.max(counts_e), 1.0)
+def _electron_double_gauss_popt(double_gauss_popt, pedestal, gain, centers_e, counts_e,
+                                electron_fit_mode='transform'):
+    """Double-Gaussian parameters in electron units, by one of two methods.
 
-    p0 = [s0_e, m0_e, s1_e, m1_e, N0_0, N1_0]
-    bounds = (
-        [0.2 * s0_e, m0_e - 0.25, 0.2 * s1_e, m1_e - 0.3, 0, 0],
-        [5.0 * s0_e, m0_e + 0.25, 5.0 * s1_e, m1_e + 0.3, 5 * cmax, 5 * cmax],
-    )
-    p0 = _clip_to_bounds(p0, bounds)
-    return curve_fit(double_gauss, centers_e, counts_e, p0=p0, bounds=bounds, maxfev=maxfev)
+    ``'transform'`` (default): analytically rescale the converged ADU fit
+    (``_double_gauss_popt_electrons`` -- exact, with ``mu_0 = 0`` / ``mu_1 = 1`` fixed
+    by construction and no refit).
+
+    ``'refit'``: fit the double Gaussian directly to the electron-unit histogram
+    (``centers_e``/``counts_e``), starting from that analytic transform, so the
+    electron-space peaks and widths are re-optimised rather than pinned by the ADU
+    fit. Widths are kept positive and amplitudes non-negative; the means are left
+    free, so the one-electron peak need not land exactly at 1 e-. Falls back to the
+    analytic transform if the refit fails to converge. (See the note in
+    ``_double_gauss_popt_electrons`` on why the transform is the default -- a refit
+    can drift ``mu_1`` off 1 and balloon ``sigma_1`` even on a clean ADU fit.)
+    """
+    transform = _double_gauss_popt_electrons(double_gauss_popt, pedestal, gain)
+    if electron_fit_mode != 'refit':
+        return transform
+    lo = [1e-12, -np.inf, 1e-12, -np.inf, 0.0, 0.0]
+    hi = [np.inf] * 6
+    try:
+        popt_e, _ = curve_fit(double_gauss, centers_e, counts_e, p0=transform,
+                              maxfev=20000, bounds=(lo, hi))
+        return popt_e
+    except (RuntimeError, ValueError):
+        return transform
+
+def _zero_one_label_adu(double_gauss_popt, gain):
+    """Legend label for an ADU zero-one subplot.
+
+    When `gain` is NaN no trustworthy one-electron peak was found, so only the
+    zero-peak parameters are shown (the one-electron amplitude has been zeroed,
+    making the plotted curve a single Gaussian) and the gain is reported as
+    undefined rather than printing a meaningless value.
+    """
+    s0, m0, s1, m1, N0, N1 = (double_gauss_popt[0], double_gauss_popt[1], double_gauss_popt[2],
+                              double_gauss_popt[3], double_gauss_popt[4], double_gauss_popt[5])
+    if np.isnan(gain):
+        return (r'$\sigma_0$ = %5.3f, $\mu_0$ = %5.3f, $N_0$ = %5.3f' % (s0, m0, N0)
+                + '\n' + r'no $1\,e^{–}$ peak found (gain undefined)')
+    return (r'$\sigma_0$ = %5.3f, $\mu_0$ = %5.3f, $\sigma_1$ = %5.3f, $\mu_1$ = %5.3f,' % (s0, m0, s1, m1)
+            + '\n' + r'$N_0$ = %5.3f, $N_1$ = %5.3f, gain = %5.3f ADU/$e^{–}$' % (N0, N1, gain))
 
 def plot_zero_one_peaks(data_ext,
                         zero_one_counts_ext,
@@ -677,6 +878,7 @@ def plot_zero_one_peaks(data_ext,
                         yscale='linear',
                         n=100,
                         do_convert_to_electrons=False,
+                        electron_fit_mode='transform',
                         plot_individual=False,
                         plot_together=True,
                         do_plot_adu=True,
@@ -689,11 +891,15 @@ def plot_zero_one_peaks(data_ext,
                         dpi=350):
 
     fig_path = Path(fig_path)
+    # Build the output base from the source filename with its final extension stripped.
+    # `base_name` is treated as a plain string and joined with the variant suffix and
+    # '.jpeg' directly (see the save sites below) -- using Path.with_suffix/.with_stem
+    # here would mistake any '.' in the stem (e.g. a voltage like VR-8.5) for the file
+    # extension and truncate the name there.
     if file != 'zero_one_peaks':
-        base_name = file[:-5] + '_zero_one_peaks'
+        base_name = Path(file).stem + '_zero_one_peaks'
     else:
         base_name = file
-    fig_name = fig_path / base_name
 
     if plot_individual:
         for ext, data in (enumerate(data_ext) if do_plot_adu else []):
@@ -712,7 +918,6 @@ def plot_zero_one_peaks(data_ext,
             ax.set_xlabel('Charge (ADU)')
             ax.set_ylabel('N')
 
-            double_gauss_coeff = tuple(double_gauss_popt)+(gain,)
             window_max = np.max(zero_one_counts)  # zero-peak height, drives y-scaling
 
             if yscale=='log':
@@ -723,8 +928,7 @@ def plot_zero_one_peaks(data_ext,
 
             curve_x = _fit_curve_x(zero_one_range[0], zero_one_range[1], len(zero_one_counts))
             ax.plot(curve_x, double_gauss(curve_x, *double_gauss_popt), 'r',
-                label=r'$\sigma_0$ = %5.3f, $\mu_0$ = %5.3f, $\sigma_1$ = %5.3f, $\mu_1$ = %5.3f,'%double_gauss_coeff[0:4]
-                +'\n'+'$N_0$ = %5.3f, $N_1$ = %5.3f, gain = %5.3f ADU/$e^{–}$'%double_gauss_coeff[4:])
+                label=_zero_one_label_adu(double_gauss_popt, gain))
             ax.legend(loc="upper right", fontsize=fontsize)
 
             if xlim=='default':
@@ -742,7 +946,7 @@ def plot_zero_one_peaks(data_ext,
                 ax.set_ylim(ylim)
 
             if save_plots:
-                output_path = fig_name.with_stem(fig_name.stem + f'_EXT{ext+1}').with_suffix('.jpeg')
+                output_path = fig_path / f'{base_name}_EXT{ext+1}.jpeg'
                 plt.savefig(str(output_path), dpi=dpi)
                 print(f'Saved plots to {output_path}')
             _finish_fig(show_plots)
@@ -754,6 +958,11 @@ def plot_zero_one_peaks(data_ext,
                 pedestal = pedestals[ext]
                 gain = gains[ext]
 
+                # No one-electron peak -> no gain -> electron conversion (divide by
+                # gain) is undefined; skip the electron plot for this extension.
+                if np.isnan(gain):
+                    continue
+
                 data_window=data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
 
                 data_window_e = convert_to_electrons(data_window, pedestal, gain)
@@ -762,14 +971,16 @@ def plot_zero_one_peaks(data_ext,
                 # plot keeps the same bins-to-window ratio when the window is widened.
                 nbins = len(zero_one_counts_ext[ext])
 
-                # Window histogram (used to refit the electron-unit double Gaussian).
+                # Window histogram (drawn as the bars).
                 zero_one_counts_e, zero_one_edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
                 zero_one_centers_e = 0.5 * (zero_one_edges_e[:-1] + zero_one_edges_e[1:])
-                bin_width_e = zero_one_edges_e[1] - zero_one_edges_e[0]
                 window_max_e = np.max(zero_one_counts_e)
 
-                double_gauss_popt_e, _ = _fit_double_gauss_electrons(
-                    zero_one_centers_e, zero_one_counts_e, double_gauss_popts[ext], pedestal, gain)
+                # Electron-unit curve: the ADU fit rescaled exactly, or a direct refit in
+                # electron units (see electron_fit_mode / _electron_double_gauss_popt).
+                double_gauss_popt_e = _electron_double_gauss_popt(
+                    double_gauss_popts[ext], pedestal, gain,
+                    zero_one_centers_e, zero_one_counts_e, electron_fit_mode)
 
                 fig, ax = plt.subplots(1, 1, figsize=individual_figsize, constrained_layout=True)
                 if show_titles:
@@ -804,7 +1015,7 @@ def plot_zero_one_peaks(data_ext,
                     ax.set_ylim(ylim_electrons)
 
                 if save_plots:
-                    output_path = fig_name.with_stem(fig_name.stem + f'_electrons_EXT{ext+1}').with_suffix('.jpeg')
+                    output_path = fig_path / f'{base_name}_electrons_EXT{ext+1}.jpeg'
                     plt.savefig(str(output_path), dpi=dpi)
                     print(f'Saved plot to {output_path}')
                 _finish_fig(show_plots)
@@ -828,7 +1039,6 @@ def plot_zero_one_peaks(data_ext,
                 zero_one_range=zero_one_ranges[ext]
 
                 ax = axs[ext]
-                double_gauss_coeff = tuple(double_gauss_popt)+(gain,)
 
                 if yscale=='log':
                     ax.set_yscale('log')
@@ -840,8 +1050,7 @@ def plot_zero_one_peaks(data_ext,
                 curve_x = _fit_curve_x(zero_one_range[0], zero_one_range[1], len(zero_one_counts))
                 fit_y = double_gauss(curve_x, *double_gauss_popt)
                 ax.plot(curve_x, fit_y, 'r',
-                    label=r'$\sigma_0$ = %5.3f, $\mu_0$ = %5.3f, $\sigma_1$ = %5.3f, $\mu_1$ = %5.3f,'%double_gauss_coeff[0:4]
-                    +'\n'+'$N_0$ = %5.3f, $N_1$ = %5.3f, gain = %5.3f ADU/$e^{–}$'%double_gauss_coeff[4:])
+                    label=_zero_one_label_adu(double_gauss_popt, gain))
 
                 ax.set_xlabel('Charge (ADU)')
                 ax.set_ylabel('N')
@@ -874,7 +1083,7 @@ def plot_zero_one_peaks(data_ext,
                 axs[i].tick_params(labelleft=True)
 
             if save_plots:
-                output_path = fig_name.with_suffix('.jpeg')
+                output_path = fig_path / f'{base_name}.jpeg'
                 plt.savefig(str(output_path), dpi=dpi)
                 print(f'Saved plot to {output_path}')
             _finish_fig(show_plots)
@@ -894,6 +1103,17 @@ def plot_zero_one_peaks(data_ext,
                 pedestal = pedestals[ext]
                 gain = gains[ext]
 
+                # No one-electron peak -> gain undefined -> cannot convert to
+                # electrons; leave the subplot empty with a note and move on.
+                if np.isnan(gain):
+                    ax.set_title(f'EXT {ext + 1}')
+                    ax.set_xlabel(r'Charge ($e^–$)')
+                    ax.set_ylabel('N')
+                    ax.text(0.5, 0.5, r'no $1\,e^{–}$ peak found',
+                            ha='center', va='center', transform=ax.transAxes)
+                    _ylims.append(None)
+                    continue
+
                 data_window = data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
 
                 data_window_e = convert_to_electrons(data_window, pedestal, gain)
@@ -902,13 +1122,15 @@ def plot_zero_one_peaks(data_ext,
                 # plot keeps the same bins-to-window ratio when the window is widened.
                 nbins = len(zero_one_counts_ext[ext])
 
-                # Window histogram (used to refit the electron-unit double Gaussian).
+                # Window histogram (drawn as the bars).
                 zero_one_counts_e, zero_one_edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
                 zero_one_centers_e = 0.5 * (zero_one_edges_e[:-1] + zero_one_edges_e[1:])
-                bin_width_e = zero_one_edges_e[1] - zero_one_edges_e[0]
 
-                double_gauss_popt_e, _ = _fit_double_gauss_electrons(
-                    zero_one_centers_e, zero_one_counts_e, double_gauss_popts[ext], pedestal, gain)
+                # Electron-unit curve: the ADU fit rescaled exactly, or a direct refit in
+                # electron units (see electron_fit_mode / _electron_double_gauss_popt).
+                double_gauss_popt_e = _electron_double_gauss_popt(
+                    double_gauss_popts[ext], pedestal, gain,
+                    zero_one_centers_e, zero_one_counts_e, electron_fit_mode)
 
                 if yscale=='log':
                     ax.set_yscale('log')
@@ -950,7 +1172,7 @@ def plot_zero_one_peaks(data_ext,
                 axs[i].tick_params(labelleft=True)
 
             if save_plots:
-                output_path = fig_name.with_stem(fig_name.stem + '_electrons').with_suffix('.jpeg')
+                output_path = fig_path / f'{base_name}_electrons.jpeg'
                 plt.savefig(str(output_path), dpi=dpi)
                 print(f'Saved plot to {output_path}')
             _finish_fig(show_plots)
@@ -1034,9 +1256,21 @@ def _value_for_extension(value, ext, n_ext):
             return value[ext]
     return value
 
+def _scalar_for_extension(value, ext, n_ext):
+    """Select a per-extension scalar from ``value``.
+
+    ``value`` may be a single number/None applied to every extension, or a
+    length-``n_ext`` list/tuple of per-extension entries (each a number or None).
+    Anything else (e.g. a scalar) is returned unchanged for every extension.
+    """
+    if isinstance(value, (list, tuple, np.ndarray)) and len(value) == n_ext:
+        return value[ext]
+    return value
+
 def get_zero_one_peaks_ext(data_ext,
                            n=100, fit_bounds='default', zero_one_test_range='auto',
-                           window_left_scale=1.0, window_right_scale=1.0):
+                           window_left_scale=1.0, window_right_scale=1.0,
+                           peakfind_density=_PEAKFIND_DENSITY, gain_seed=None):
     zero_one_counts_ext = []
     zero_one_edges_ext = []
     pedestals = []
@@ -1046,6 +1280,7 @@ def get_zero_one_peaks_ext(data_ext,
     for ext, data in enumerate(data_ext):
 
         zero_one_test_range_ext = _value_for_extension(zero_one_test_range, ext, len(data_ext))
+        gain_seed_ext = _scalar_for_extension(gain_seed, ext, len(data_ext))
 
         zero_one_counts, zero_one_edges, pedestal, noise, gain, double_gauss_popt, zero_one_range = calculate_noise_gain(
             data,
@@ -1054,6 +1289,8 @@ def get_zero_one_peaks_ext(data_ext,
             fit_bounds=fit_bounds,
             window_left_scale=window_left_scale,
             window_right_scale=window_right_scale,
+            peakfind_density=peakfind_density,
+            gain_seed=gain_seed_ext,
         )
         zero_one_counts_ext.append(zero_one_counts)
         zero_one_edges_ext.append(zero_one_edges)
@@ -1063,3 +1300,43 @@ def get_zero_one_peaks_ext(data_ext,
         zero_one_ranges.append(zero_one_range)
 
     return zero_one_counts_ext, zero_one_edges_ext, pedestals, gains, double_gauss_popts, zero_one_ranges
+
+
+#---------------- Per-extension summary (CSV) ----------------------------
+
+# Column order of the per-extension summary. Extends the nonlinearity_studies columns
+# (ext, gain_adu_per_e, noise_e) with noise_adu, the zero-peak width in raw ADU.
+_EXTENSION_SUMMARY_FIELDS = ['ext', 'gain_adu_per_e', 'noise_adu', 'noise_e']
+
+def build_extension_summary(gains, double_gauss_popts):
+    """Per-extension rows of gain (ADU/e-) and noise, in both ADU and e-.
+
+    ``noise_adu`` is the zero-electron peak width (``s0``, the first double-Gaussian
+    coefficient, in ADU); ``noise_e`` is that same width divided by the gain. When no
+    one-electron peak was found the gain is NaN, so noise_e is NaN as well, but
+    noise_adu is still reported (it does not depend on the gain).
+    """
+    rows = []
+    for ext, gain in enumerate(gains):
+        noise_adu = double_gauss_popts[ext][0]  # s0: std of the zero-electron peak in ADU
+        rows.append({
+            'ext': ext + 1,
+            'gain_adu_per_e': gain,
+            'noise_adu': noise_adu,
+            'noise_e': noise_adu / gain,  # ADU -> e- by dividing by gain (ADU/e-)
+        })
+    return rows
+
+def write_extension_summary_csv(save_path, gains, double_gauss_popts):
+    """Write the per-extension gain/noise summary to ``save_path`` as CSV.
+
+    Returns the list of summary rows (see build_extension_summary).
+    """
+    rows = build_extension_summary(gains, double_gauss_popts)
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    with save_path.open('w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=_EXTENSION_SUMMARY_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return rows
