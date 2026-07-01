@@ -11,20 +11,26 @@ the pieces needed to:
 
 import csv
 
+from datetime import datetime
+
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
 from astropy.stats import biweight_location, biweight_midvariance
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks as scipy_find_peaks
+from scipy.special import erf
 
 from pathlib import Path
 from tqdm import tqdm
 
 #---------------- Curves ----------------------------
 
-def double_gauss(x, s0, m0, s1, m1, N0, N1):
-    return N0 * np.exp(-(x-m0)**2/(2*s0**2)) + N1 * np.exp(-(x-m1)**2/(2*s1**2))
+def double_gauss(x, s, m0, m1, N0, N1):
+    # Both the zero- and one-electron Gaussians share a single width ``s`` (the readout
+    # noise): the peaks are physically the same noise distribution shifted by 1 e-, so
+    # one sigma is fit to both. popt layout is (s, m0, m1, N0, N1).
+    return N0 * np.exp(-(x-m0)**2/(2*s**2)) + N1 * np.exp(-(x-m1)**2/(2*s**2))
 
 #---------------- (0) Convert to electrons ----------------------------
 
@@ -71,6 +77,11 @@ _MAX_GAIN_ADU = 1.5
 # than pinning at 1.5 and passing. The lower edge stays hard (the gain is always
 # > 1). Acceptance still uses the band [_MIN_GAIN_ADU, _MAX_GAIN_ADU].
 _GAIN_FIT_MARGIN = 0.3
+
+# Default figure sizes (inches), shared by every plot function so all the multi-panel
+# (2x2) figures match and all the single-panel figures match. Overridable per call.
+_SUBPLOTS_FIGSIZE = (13, 9)    # 2x2 grids (zero/one "together", dark current, charge-per-column)
+_INDIVIDUAL_FIGSIZE = (8, 6)   # single-panel per-extension figures
 
 def _peakfind_bins(hist_range, density=_PEAKFIND_DENSITY):
     left, right = hist_range
@@ -306,34 +317,25 @@ def _auto_zero_one_setup(data, zero_one_test_range, n, window_left_scale=1.0, wi
     if m1_high <= m1_low:
         m1_high = min(fit_right, one_hi)
 
-    # Floor both widths at a fraction of the zero-peak width: a real peak cannot be
-    # narrower than the readout noise, so this stops curve_fit from collapsing
-    # either Gaussian into a delta spike on a single noisy bin (the low-statistics
-    # failure that otherwise yields a confident but bogus gain).
+    # Floor the shared width at a fraction of the zero-peak width: a real peak cannot
+    # be narrower than the readout noise, so this stops curve_fit from collapsing the
+    # Gaussians into a delta spike on a single noisy bin (the low-statistics failure
+    # that otherwise yields a confident but bogus gain). popt layout is
+    # (s, m0, m1, N0, N1): both peaks share the single width ``s``.
     sigma_floor = max(0.3 * zero_peak_width, (zero_one_centers[1] - zero_one_centers[0]) / 10, 1e-8)
     fit_bounds_low = [
         sigma_floor,
         max(fit_left, zero_peak_charge - m0_margin),
-        sigma_floor,
         m1_low,
         0,
         0,
     ]
     fit_bounds_high = [
-        # sigma_0 is the well-determined pedestal width; bound it tightly so the
-        # zero Gaussian cannot broaden to absorb the one-electron region (which
-        # would drag mu_1 -- and the gain -- low on a weak cluster).
+        # The shared sigma is set by the well-determined pedestal width; bound it
+        # tightly so the Gaussians cannot broaden to absorb the one-electron region
+        # (which would drag mu_1 -- and the gain -- low on a weak cluster).
         2.0 * zero_peak_width,
         max(fit_right, zero_peak_charge + m0_margin),
-        # sigma_1 (width of the one-electron peak) is comparable to the readout
-        # noise (~sigma_0), so cap it at the zero-peak width. This is deliberately
-        # tight: a looser bound lets curve_fit broaden the one-electron Gaussian
-        # into a shallow smear that mops up the zero-peak tail/shoulder instead of
-        # sitting on the bump, which both biases the gain and makes the fit fail on
-        # the clean peaks. (A genuinely broad, weak one-electron population sitting
-        # close to the pedestal -- as on a very narrow zero peak -- cannot be fit
-        # this way and is reported as no-peak; see the README.)
-        1.0 * zero_peak_width,
         # mu_1's upper edge is the gain-band edge with headroom (m1_high, already
         # capped at fit_right). Do NOT scale it: when the pedestal is not subtracted
         # the zero peak sits at a (often negative) raw-ADU offset, so a multiplier
@@ -352,7 +354,6 @@ def _auto_zero_one_setup(data, zero_one_test_range, n, window_left_scale=1.0, wi
     p0 = [
         zero_peak_width,
         zero_peak_charge,
-        max(zero_peak_width, sigma_floor),  # sigma_1 ~ readout noise (~sigma_0)
         one_peak_charge,
         max_zero_one_counts,
         one_peak_height,
@@ -381,7 +382,7 @@ def _one_electron_peak_is_real(centers, counts, popt, zero_peak_width):
     while still rejecting a featureless monotonic slope. The strength threshold is
     kept lenient so a weak-but-real cluster (a genuine low gain near 1 e-) passes.
     """
-    s0, m0, s1, m1, N0, N1 = (popt[0], popt[1], popt[2], popt[3], popt[4], popt[5])
+    s, m0, m1, N0, N1 = (popt[0], popt[1], popt[2], popt[3], popt[4])
     centers = np.asarray(centers, dtype=float)
     counts = np.asarray(counts, dtype=float)
     bin_width = centers[1] - centers[0]
@@ -389,14 +390,14 @@ def _one_electron_peak_is_real(centers, counts, popt, zero_peak_width):
         return False
 
     # Residual above the zero-electron Gaussian, smoothed on the zero-peak scale.
-    zero_model = N0 * np.exp(-(centers - m0) ** 2 / (2 * s0 ** 2))
+    zero_model = N0 * np.exp(-(centers - m0) ** 2 / (2 * s ** 2))
     resid = counts - zero_model
     smooth_win = max(3, int(round(zero_peak_width / bin_width)))
     resid_smooth = _smooth_counts(resid, window=smooth_win)
 
     # A band around mu_1 (the candidate peak). Use the median over the band so a
     # flat-topped low-statistics peak is treated the same as a sharp one.
-    half = max(s1, zero_peak_width)
+    half = max(s, zero_peak_width)
     band = (centers >= m1 - half) & (centers <= m1 + half)
     if not np.any(band):
         return False
@@ -456,9 +457,9 @@ def calculate_noise_gain(data, zero_one_test_range='auto', n=100, fit_bounds='de
                            maxfev=20000, bounds=fit_bounds)
 
     # Extract pedestal, noise, and the double-Gaussian coefficients from the fit.
-    s0_fit, m0_fit, s1_fit, m1_fit, N0_fit, N1_fit = popt
+    s_fit, m0_fit, m1_fit, N0_fit, N1_fit = popt
     pedestal = m0_fit  # Pedestal is mean of the zero-electron peak
-    noise = s0_fit     # Noise is the standard deviation of the zero-electron peak
+    noise = s_fit      # Noise is the shared peak width (std of the zero-electron peak)
 
     # Decide whether the one-electron Gaussian is a real peak or just the fitter
     # using the second Gaussian to absorb the (non-Gaussian) tail of the zero peak
@@ -475,7 +476,7 @@ def calculate_noise_gain(data, zero_one_test_range='auto', n=100, fit_bounds='de
         # the one-electron amplitude so downstream plotting draws only the single
         # (zero-electron) Gaussian.
         gain = np.nan
-        popt = np.array([s0_fit, m0_fit, s1_fit, m1_fit, N0_fit, 0.0])
+        popt = np.array([s_fit, m0_fit, m1_fit, N0_fit, 0.0])
 
     return zero_one_counts, zero_one_edges, pedestal, noise, gain, popt, zero_one_range
 
@@ -664,10 +665,10 @@ def _pedsub_cache_path(source_path, cache_dir=None, *, axis=None, n_std_to_mask=
                        use_biweight_loc=True, use_biweight_midvar=True, max_iter=5,
                        overscan_cols=None):
     source = Path(source_path)
-    base = cache_dir if cache_dir is not None else source.parent
-    base = Path(base)
-    if cache_dir is not None:
-        base.mkdir(parents=True, exist_ok=True)
+    # Default to a `cache/` subfolder beside the source so the pedsub FITS files
+    # don't clutter the data directory; an explicit cache_dir overrides this.
+    base = Path(cache_dir) if cache_dir is not None else source.parent / 'cache'
+    base.mkdir(parents=True, exist_ok=True)
     if axis is None:
         # Legacy single-slot path (no params supplied).
         return base / f'{source.stem}.pedsub.fits'
@@ -693,7 +694,7 @@ def pedestal_subtract_ext_cached(data_ext, source_path, n_std_to_mask, axis='row
                                  use_biweight_loc=True, use_biweight_midvar=True,
                                  max_iter=5, cache_dir=None, force=False, verbose=True,
                                  overscan_cols=None):
-    """Pedestal-subtract each extension, caching the result to a FITS file next to the source.
+    """Pedestal-subtract each extension, caching the result to a FITS file in a ``cache/`` folder beside the source.
 
     Each distinct parameter combination (axis, n_std_to_mask, biweight flags, max_iter,
     algorithm version) is cached to its own file, so switching e.g. axis from 'row' to
@@ -807,12 +808,12 @@ def _double_gauss_popt_electrons(double_gauss_popt, pedestal, gain):
     We transform analytically rather than re-fitting in electron units: an
     independent refit has nothing to gain (the answer is fixed by the transform) and
     its free parameters only let curve_fit drift the one-electron peak off
-    ``mu_1 = 1`` and balloon ``sigma_1`` -- exactly the spurious wide/displaced
+    ``mu_1 = 1`` and balloon the shared ``sigma`` -- exactly the spurious wide/displaced
     electron-space fit otherwise seen even when the ADU fit is clean.
     """
-    s0, m0, s1, m1, N0, N1 = (double_gauss_popt[0], double_gauss_popt[1], double_gauss_popt[2],
-                              double_gauss_popt[3], double_gauss_popt[4], double_gauss_popt[5])
-    return np.array([s0 / gain, (m0 - pedestal) / gain, s1 / gain, (m1 - pedestal) / gain, N0, N1])
+    s, m0, m1, N0, N1 = (double_gauss_popt[0], double_gauss_popt[1], double_gauss_popt[2],
+                         double_gauss_popt[3], double_gauss_popt[4])
+    return np.array([s / gain, (m0 - pedestal) / gain, (m1 - pedestal) / gain, N0, N1])
 
 def _electron_double_gauss_popt(double_gauss_popt, pedestal, gain, centers_e, counts_e,
                                 electron_fit_mode='transform'):
@@ -829,13 +830,13 @@ def _electron_double_gauss_popt(double_gauss_popt, pedestal, gain, centers_e, co
     free, so the one-electron peak need not land exactly at 1 e-. Falls back to the
     analytic transform if the refit fails to converge. (See the note in
     ``_double_gauss_popt_electrons`` on why the transform is the default -- a refit
-    can drift ``mu_1`` off 1 and balloon ``sigma_1`` even on a clean ADU fit.)
+    can drift ``mu_1`` off 1 and balloon the shared ``sigma`` even on a clean ADU fit.)
     """
     transform = _double_gauss_popt_electrons(double_gauss_popt, pedestal, gain)
     if electron_fit_mode != 'refit':
         return transform
-    lo = [1e-12, -np.inf, 1e-12, -np.inf, 0.0, 0.0]
-    hi = [np.inf] * 6
+    lo = [1e-12, -np.inf, -np.inf, 0.0, 0.0]  # (s, m0, m1, N0, N1)
+    hi = [np.inf] * 5
     try:
         popt_e, _ = curve_fit(double_gauss, centers_e, counts_e, p0=transform,
                               maxfev=20000, bounds=(lo, hi))
@@ -851,12 +852,12 @@ def _zero_one_label_adu(double_gauss_popt, gain):
     making the plotted curve a single Gaussian) and the gain is reported as
     undefined rather than printing a meaningless value.
     """
-    s0, m0, s1, m1, N0, N1 = (double_gauss_popt[0], double_gauss_popt[1], double_gauss_popt[2],
-                              double_gauss_popt[3], double_gauss_popt[4], double_gauss_popt[5])
+    s, m0, m1, N0, N1 = (double_gauss_popt[0], double_gauss_popt[1], double_gauss_popt[2],
+                         double_gauss_popt[3], double_gauss_popt[4])
     if np.isnan(gain):
-        return (r'$\sigma_0$ = %5.3f, $\mu_0$ = %5.3f, $N_0$ = %5.3f' % (s0, m0, N0)
+        return (r'$\sigma$ = %5.3f, $\mu_0$ = %5.3f, $N_0$ = %5.3f' % (s, m0, N0)
                 + '\n' + r'no $1\,e^{–}$ peak found (gain undefined)')
-    return (r'$\sigma_0$ = %5.3f, $\mu_0$ = %5.3f, $\sigma_1$ = %5.3f, $\mu_1$ = %5.3f,' % (s0, m0, s1, m1)
+    return (r'$\sigma$ = %5.3f, $\mu_0$ = %5.3f, $\mu_1$ = %5.3f,' % (s, m0, m1)
             + '\n' + r'$N_0$ = %5.3f, $N_1$ = %5.3f, gain = %5.3f ADU/$e^{–}$' % (N0, N1, gain))
 
 def plot_zero_one_peaks(data_ext,
@@ -866,8 +867,8 @@ def plot_zero_one_peaks(data_ext,
                         gains, 
                         double_gauss_popts, 
                         zero_one_ranges,
-                        individual_figsize=(7,5),
-                        subplots_figsize=(13,9),
+                        individual_figsize=_INDIVIDUAL_FIGSIZE,
+                        subplots_figsize=_SUBPLOTS_FIGSIZE,
                         xlim='default',
                         ylim='default',
                         ylim_electrons='default',
@@ -996,7 +997,7 @@ def plot_zero_one_peaks(data_ext,
                 ax.set_ylabel('N')
                 curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(zero_one_counts_e))
                 ax.plot(curve_x_e, double_gauss(curve_x_e, *double_gauss_popt_e), 'r',
-                    label=r'$\sigma_0$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\sigma_1$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:4]
+                    label=r'$\sigma$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:3]
                     +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
                 ax.legend(loc="upper right", fontsize=fontsize)
 
@@ -1143,7 +1144,7 @@ def plot_zero_one_peaks(data_ext,
                 curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(zero_one_counts_e))
                 fit_y_e = double_gauss(curve_x_e, *double_gauss_popt_e)
                 ax.plot(curve_x_e, fit_y_e, 'r',
-                    label=r'$\sigma_0$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\sigma_1$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:4]
+                    label=r'$\sigma$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:3]
                     +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
                 ax.legend(loc="upper right", fontsize=fontsize - 2)
                 ax.set_xlabel(r'Charge ($e^–$)')
@@ -1177,6 +1178,175 @@ def plot_zero_one_peaks(data_ext,
                 print(f'Saved plot to {output_path}')
             _finish_fig(show_plots)
 
+#---------------- Plotting: dark-current window ----------------------------
+
+def _dark_current_fit_label(sigma_e, gain, N1):
+    """Legend text for the red fit curve: shared width (e-), gain, and 1 e- amplitude N1."""
+    return (r'$\sigma$ = %.3f $e^-$' % sigma_e
+            + '\n' + r'gain = %.3f ADU/$e^-$, $N_1$ = %.4g' % (gain, N1))
+
+def plot_dark_current_zero_one(data_ext, zero_one_counts_ext, zero_one_edges_ext,
+                               pedestals, gains, double_gauss_popts, zero_one_ranges,
+                               dark_current_rows, count_center='one_electron',
+                               count_nsigma=1.0, electron_fit_mode='transform',
+                               nimages=10, figsize=_SUBPLOTS_FIGSIZE, fontsize=10, yscale='log',
+                               suptitle='Dark-Current Window (Zero-One Peaks, electrons)',
+                               additional_title='', show_titles=True,
+                               save_plots=False, show_plots=True,
+                               fig_path='./', file='dark_current', dpi=350):
+    """Plot the electron-unit zero/one distributions with the dark-current count window.
+
+    One subplot per extension (2x2): the electron-unit histogram and fitted
+    double-Gaussian curve, and a legend with the shared sigma, the gain and the dark
+    current(s). When the 'count' method was used, vertical dashed lines mark the
+    +/- ``count_nsigma`` * sigma charge window it integrates around 1 e-; otherwise
+    those lines are omitted and (when the 'weighted' method was used) the legend
+    instead reports that method's dark current and its formula. Extensions with no
+    one-electron peak (gain undefined) cannot be converted to electrons and are left
+    with an explanatory note.
+    """
+    fig_path = Path(fig_path)
+    base_name = Path(file).stem + '_dark_current' if file != 'dark_current' else file
+
+    fig, axs = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
+    if show_titles:
+        fig.suptitle(f'{additional_title}{suptitle} (Nimages = {nimages})')
+    axs = axs.flatten()
+
+    for ext, data in enumerate(data_ext):
+        ax = axs[ext]
+        ax.set_title(f'EXT {ext + 1}')
+        ax.set_xlabel(r'Charge ($e^-$)')
+        ax.set_ylabel('N')
+
+        pedestal = pedestals[ext]
+        gain = gains[ext]
+        if np.isnan(gain):
+            ax.text(0.5, 0.5, r'no $1\,e^-$ peak found', ha='center', va='center',
+                    transform=ax.transAxes)
+            continue
+
+        data = np.asarray(data).flatten()
+        zero_one_range = zero_one_ranges[ext]
+        data_window = data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
+        data_window_e = convert_to_electrons(data_window, pedestal, gain)
+        zero_one_range_e = convert_to_electrons(np.asarray(zero_one_range), pedestal, gain,
+                                                flatten=False)
+        nbins = len(zero_one_counts_ext[ext])
+        counts_e, edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
+        centers_e = 0.5 * (edges_e[:-1] + edges_e[1:])
+
+        popt_e = _electron_double_gauss_popt(double_gauss_popts[ext], pedestal, gain,
+                                             centers_e, counts_e, electron_fit_mode)
+        sigma_e, N1 = popt_e[0], popt_e[4]
+
+        if yscale != 'linear':
+            ax.set_yscale(yscale)
+        ax.stairs(_bar_heights(counts_e, yscale), edges_e, fill=True, color='#4e117d')
+
+        curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(counts_e))
+        ax.plot(curve_x_e, double_gauss(curve_x_e, *popt_e), '#8dde1b',
+                label=_dark_current_fit_label(sigma_e, gain, N1))
+
+        dc_count = dark_current_rows[ext].get('dark_current_count_e_per_pix_day')
+        if dc_count is not None:
+            # 'count' method was used: draw its +/- count_nsigma * sigma window about the
+            # 1 e- charge, computed in ADU exactly as the method does, then converted to
+            # electrons so the lines match the pixels actually counted (independent of
+            # any refit). Label it with the method's dark current.
+            popt = double_gauss_popts[ext]
+            sigma_adu = popt[0]
+            center_adu = popt[2] if count_center == 'mu1' else pedestal + gain
+            lo_e = (center_adu - count_nsigma * sigma_adu - pedestal) / gain
+            hi_e = (center_adu + count_nsigma * sigma_adu - pedestal) / gain
+            window_label = (rf'count window ($\pm${count_nsigma:g}$\,\sigma$)'
+                            + '\n' + r'dark current = %.3g $e^-$/pix/day' % dc_count)
+            ax.axvline(lo_e, color='k', linestyle=':', linewidth=1.2, label=window_label)
+            ax.axvline(hi_e, color='k', linestyle=':', linewidth=1.2)
+        else:
+            # 'count' not used: no window lines. If the 'weighted' method was used,
+            # report its dark current and formula as a legend-only entry.
+            dc_weighted = dark_current_rows[ext].get('dark_current_weighted_e_per_pix_day')
+            if dc_weighted is not None:
+                ax.plot([], [], ' ',
+                        label=(r'dark current = %.3g $e^-$/pix/day' % dc_weighted
+                               + '\n' + r'$n_{events}$ / img $ = N_1$ / $(N_1 + N_0)$'))
+
+        ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
+        ax.legend(loc='upper right', fontsize=fontsize - 2)
+
+    if save_plots:
+        output_path = fig_path / f'{base_name}.jpeg'
+        plt.savefig(str(output_path), dpi=dpi)
+        print(f'Saved plot to {output_path}')
+    _finish_fig(show_plots)
+
+def plot_charge_per_column(data_ext, n_std_to_mask=1.5, fit_cols_ext=None,
+                           figsize=_SUBPLOTS_FIGSIZE, additional_title='', show_titles=True,
+                           nimages=1, verbose=False, save_plots=False, show_plots=True,
+                           fig_path='./', file='charge_per_column', dpi=350):
+    """Median charge per column for each extension, as a 2x2 grid of scatter plots.
+
+    Intended for the *raw* (pre-pedestal-subtraction) data, so the per-column medians
+    reveal which columns carry anomalous charge. A column is flagged "hot" (drawn red)
+    when its median sits at least ``n_std_to_mask`` biweight standard deviations from
+    the biweight location of the extension -- the same robust threshold the pedestal
+    subtraction uses to mask outliers. Every column is plotted; ``fit_cols_ext``, if
+    given, is a per-extension ``(c0, c1)`` slice (or None) marking which columns the
+    zero/one fit keeps -- the columns *outside* it are shaded light grey, so the plot
+    shows the full frame while making the masked-out region visible.
+    """
+    fig_path = Path(fig_path)
+    base_name = Path(file).stem + '_charge_per_column' if file != 'charge_per_column' else file
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
+    if show_titles:
+        fig.suptitle(f'{additional_title}Median Charge per Column (Nimages = {nimages})')
+
+    for ext, data in enumerate(data_ext):
+        ax = axes.flat[ext]
+        data = np.asarray(data)
+        col_idx = np.arange(data.shape[1])
+        median_charge = np.median(data, axis=0)
+
+        flat = data.flatten()
+        loc = biweight_location(flat, ignore_nan=True)
+        scale = np.sqrt(biweight_midvariance(flat, ignore_nan=True))
+        hot = np.abs(median_charge - loc) >= n_std_to_mask * scale
+
+        ax.scatter(col_idx[~hot], median_charge[~hot], s=1)
+        ax.scatter(col_idx[hot], median_charge[hot], s=1, color='red')
+
+        # Shade the columns excluded by fit_cols (Python-slice semantics handle negative
+        # or None endpoints). Each maximal run of excluded columns is one grey span, so a
+        # left and/or right cut both show; nothing is drawn when all columns are kept.
+        fc = fit_cols_ext[ext] if fit_cols_ext is not None else None
+        if fc is not None:
+            kept = np.zeros(data.shape[1], dtype=bool)
+            kept[fc[0]:fc[1]] = True
+            edges = np.diff(np.concatenate(([0], (~kept).astype(np.int8), [0])))
+            for start, end in zip(np.where(edges == 1)[0], np.where(edges == -1)[0]):
+                ax.axvspan(start - 0.5, end - 0.5, color='gray', alpha=0.15, linewidth=0)
+
+        if show_titles:
+            ax.set_title(f'EXT {ext + 1}')
+        if ext % 2 == 0:        # left column of the grid
+            ax.set_ylabel('Median Charge (ADU)')
+        if ext // 2 == 1:       # bottom row of the grid
+            ax.set_xlabel('Column')
+
+        if verbose:
+            pct = 100 * hot.sum() / len(hot) if len(hot) else 0.0
+            print(f'EXT {ext + 1}: {int(hot.sum())} hot columns ({pct:.1f}%) '
+                  f'(median charge >= {n_std_to_mask} SDs from pedestal location): '
+                  f'{col_idx[hot].tolist()}')
+
+    if save_plots:
+        output_path = fig_path / f'{base_name}.jpeg'
+        plt.savefig(str(output_path), dpi=dpi)
+        print(f'Saved plot to {output_path}')
+    _finish_fig(show_plots)
+
 #---------------- Load FITS ----------------------------
 
 def get_fits(file_input):
@@ -1204,6 +1374,85 @@ def get_fits(file_input):
         ext_charge = [hdu_list[i].data for i in range(1, 5)]
 
     return ext_charge
+
+def get_exposure_time_days(file_input):
+    """Exposure time in days, read from the FITS headers as ``DATEEND - DATEINI``.
+
+    Scans every HDU (primary + extensions) for the ISO-8601 ``DATEINI`` (start) and
+    ``DATEEND`` (end) timestamps and returns their difference converted to days.
+
+    The exposure time is the per-image integration time even for a stitched frame:
+    each pixel of a stitched image was exposed for the same duration as a single
+    image (stitching adds pixels, not exposure), and ``stitch_fits`` copies the
+    first image's headers, so this returns that single image's exposure as required.
+
+    Returns ``np.nan`` if either timestamp is missing.
+    """
+    file_path = Path(file_input).resolve()
+    if not file_path.exists():
+        raise FileNotFoundError(f"FITS file not found: {file_path}")
+
+    dateini = dateend = None
+    with fits.open(str(file_path)) as hdu_list:
+        for hdu in hdu_list:
+            if dateini is None and 'DATEINI' in hdu.header:
+                dateini = hdu.header['DATEINI']
+            if dateend is None and 'DATEEND' in hdu.header:
+                dateend = hdu.header['DATEEND']
+            if dateini is not None and dateend is not None:
+                break
+
+    if dateini is None or dateend is None:
+        return np.nan
+
+    t_start = datetime.fromisoformat(str(dateini))
+    t_end = datetime.fromisoformat(str(dateend))
+    return (t_end - t_start).total_seconds() / 86400.0
+
+def get_pixel_binning(file_input):
+    """(NPBIN, NSBIN) = vertical/horizontal pixel binning, from the FITS headers.
+
+    The detector is read out binned, so each image pixel holds the summed charge of
+    NPBIN (vertical) x NSBIN (horizontal) physical CCD pixels. Scans every HDU for the
+    keys and returns them as ints; a missing key is returned as ``None`` so the caller
+    can warn and fall back to 1 (no binning).
+    """
+    file_path = Path(file_input).resolve()
+    if not file_path.exists():
+        raise FileNotFoundError(f"FITS file not found: {file_path}")
+
+    npbin = nsbin = None
+    with fits.open(str(file_path)) as hdu_list:
+        for hdu in hdu_list:
+            if npbin is None and 'NPBIN' in hdu.header:
+                npbin = int(hdu.header['NPBIN'])
+            if nsbin is None and 'NSBIN' in hdu.header:
+                nsbin = int(hdu.header['NSBIN'])
+            if npbin is not None and nsbin is not None:
+                break
+    return npbin, nsbin
+
+def raw_pedestal_locations(data_ext, use_biweight=False):
+    """Robust per-extension pedestal (zero-peak) location of the RAW data.
+
+    Intended to be called on the raw extensions *before* any pedestal subtraction,
+    so the reported baseline is the physical pedestal level rather than the ~0
+    baseline left after row/column subtraction. Returns one value per extension in
+    ADU: the median of the (finite) pixels by default -- robust to the sparse
+    positive-charge tail since the zero-electron peak dominates -- or the Tukey
+    biweight location when ``use_biweight=True``.
+    """
+    locations = []
+    for data in data_ext:
+        flat = np.asarray(data, dtype=float).flatten()
+        flat = flat[np.isfinite(flat)]
+        if flat.size == 0:
+            locations.append(np.nan)
+        elif use_biweight:
+            locations.append(float(biweight_location(flat)))
+        else:
+            locations.append(float(np.median(flat)))
+    return locations
 
 # CCD-geometry header keys used to locate the serial overscan columns.
 _OVERSCAN_HEADER_KEYS = ('PRESCAN', 'PHYSCOL', 'NCOL', 'NCOLPRE', 'NSBIN')
@@ -1302,41 +1551,254 @@ def get_zero_one_peaks_ext(data_ext,
     return zero_one_counts_ext, zero_one_edges_ext, pedestals, gains, double_gauss_popts, zero_one_ranges
 
 
+#---------------- Dark current ----------------------------
+
+# CSV column name for each dark-current counting method. Only the chosen method(s)
+# are computed and written, so the user can run one or several and compare them.
+_DARK_CURRENT_COLUMN = {
+    'count': 'dark_current_count_e_per_pix_day',
+    'integrate': 'dark_current_integrate_e_per_pix_day',
+    'weighted': 'dark_current_weighted_e_per_pix_day',
+}
+
+# Ordered list of every method, used both to expand 'all' and to order CSV columns.
+_DARK_CURRENT_METHODS = ('count', 'integrate', 'weighted')
+
+def _resolve_dark_current_methods(method):
+    """Methods to compute, from a 'count'/'integrate'/'weighted'/'all' selector."""
+    if method == 'all':
+        return _DARK_CURRENT_METHODS
+    if method in _DARK_CURRENT_METHODS:
+        return (method,)
+    raise ValueError("dark current method must be one of 'count', 'integrate', "
+                     f"'weighted', or 'all'; got {method!r}")
+
+def _single_electron_count_window(data, pedestal, gain, sigma0_adu, mu1, count_center,
+                                  nsigma=1.0):
+    """Number of pixels within ``nsigma`` peak sigmas of the 1 e- charge (method 1).
+
+    Counts every pixel whose charge lies within +/- ``nsigma * sigma0_adu`` (a multiple
+    of the fitted peak width sigma) of the one-electron charge. The window is centred
+    either on the *ideal* 1 e- (``pedestal + gain``, ``count_center='one_electron'``)
+    or on the *fitted* one-electron mean ``mu1`` (``count_center='mu1'``).
+
+    The half-width uses the single shared width sigma fit to both peaks; it is set by
+    the bulk of the pixels (the zero peak) and so is well-determined even when there
+    are only a handful of single-electron events, keeping the window width stable
+    across extensions.
+
+    The zero-peak tail is deliberately NOT subtracted: those pixels cannot be physically
+    distinguished from genuine single-electron events, so this is an inclusive
+    (upper-bound) count. A narrower window (``nsigma < 1``) cuts the zero-peak tail
+    contamination that dominates at low dark current, at the cost of capturing a smaller
+    fraction of the true 1 e- population.
+
+    The +/- ``nsigma`` window holds only a fraction ``erf(nsigma / sqrt(2))`` of a
+    Gaussian's area (0.6827 at nsigma = 1), so the raw count is divided by that fraction
+    to estimate the *total* number of pixels under the one-electron Gaussian -- bringing
+    this method into agreement with the 'integrate' and 'weighted' methods. (Now that
+    both peaks share one width, the window width matches the one-electron peak exactly,
+    so the correction is the simple Gaussian fraction.)
+
+    Returns ``np.nan`` when the gain is undefined (no one-electron peak).
+    """
+    if not np.isfinite(gain):
+        return np.nan
+    center = mu1 if count_center == 'mu1' else pedestal + gain
+    half = nsigma * sigma0_adu
+    lo, hi = center - half, center + half
+    flat = np.asarray(data).flatten()
+    flat = flat[np.isfinite(flat)]
+    count = float(np.count_nonzero((flat >= lo) & (flat <= hi)))
+    return count / erf(nsigma / np.sqrt(2))  # scale window count up to the full Gaussian
+
+def _single_electron_count_integral(double_gauss_popt, zero_one_edges, gain):
+    """Number of single-electron events from the area under the fitted 1 e- Gaussian (method 2).
+
+    The fitted one-electron Gaussian is ``N1 * exp(-(x-m1)^2 / (2 s^2))`` in counts
+    vs charge (ADU), where ``s`` is the shared peak width; its analytic area is
+    ``N1 * s * sqrt(2*pi)`` (counts*ADU). Dividing by the histogram bin width converts
+    that area to a pixel count. This is a conservative/upper-bound estimate and is
+    sensitive to the quality of the fit.
+
+    Returns ``np.nan`` when the gain is undefined (the one-electron amplitude has been
+    zeroed upstream, so there is no trustworthy peak to integrate).
+    """
+    if not np.isfinite(gain):
+        return np.nan
+    s, N1 = double_gauss_popt[0], double_gauss_popt[4]
+    bin_width = zero_one_edges[1] - zero_one_edges[0]
+    if bin_width <= 0:
+        return np.nan
+    area = N1 * s * np.sqrt(2 * np.pi)  # counts * ADU
+    return area / bin_width             # -> number of pixels
+
+def _single_electron_count_weighted(double_gauss_popt, gain):
+    """One-electron peak's amplitude fraction of the double Gaussian (method 3).
+
+    The "event count" is simply the one-electron amplitude fraction
+    ``n_events = N1 / (N1 + N0)`` -- the share of the two-peak amplitude carried by the
+    one-electron Gaussian. This is already a per-image-pixel quantity (the fraction of
+    image pixels in the one-electron peak), so ``calculate_dark_current`` forms the rate
+    by dividing only by the pixel binning (to reach a per-*physical*-pixel rate) and the
+    exposure -- it is NOT divided by the pixel count, which would cancel in the ratio.
+
+    Returns ``np.nan`` when the gain is undefined (the one-electron amplitude has been
+    zeroed upstream, so there is no trustworthy peak) or when the amplitudes are
+    non-positive (no fraction can be formed).
+    """
+    if not np.isfinite(gain):
+        return np.nan
+    N0, N1 = double_gauss_popt[3], double_gauss_popt[4]
+    denom = N1 + N0
+    if denom <= 0:
+        return np.nan
+    return N1 / denom
+
+def calculate_dark_current(data_ext, pedestals, gains, double_gauss_popts,
+                           zero_one_edges_ext, exposure_days, method='all',
+                           count_center='one_electron', count_nsigma=1.0,
+                           pixel_binning=1):
+    """Per-extension dark current (electrons / physical pixel / day) by one or more methods.
+
+    Dark current = (number of single-electron events) / (number of physical pixels) /
+    (exposure time in days). The single-electron events are counted by:
+
+    - ``'count'``: pixels within ``count_nsigma`` peak sigmas of the 1 e- charge,
+      divided by the Gaussian fraction ``erf(count_nsigma/sqrt(2))`` to estimate the
+      full one-electron count (``_single_electron_count_window``; ``count_center``
+      selects the centre, ``count_nsigma`` the half-width). The half-width uses the
+      single fitted peak width sigma, well-determined even at low statistics (see that
+      function). Use ``count_nsigma < 1`` to shrink the window and reduce zero-peak tail
+      contamination.
+    - ``'integrate'``: area under the fitted one-electron Gaussian
+      (``_single_electron_count_integral``; a conservative upper bound).
+    - ``'weighted'``: the one-electron amplitude fraction ``N1 / (N1 + N0)``
+      (``_single_electron_count_weighted``). This is already per image pixel, so its
+      rate is ``N1/(N1+N0) / pixel_binning / exposure_days`` -- divided only by the
+      binning and exposure, NOT by the pixel count (which cancels in the ratio).
+
+    ``method`` may be ``'count'``, ``'integrate'``, ``'weighted'`` or ``'all'`` -- only
+    the requested method(s) are computed.
+
+    The detector is read out binned, so each image pixel sums ``pixel_binning``
+    (= NPBIN * NSBIN) physical CCD pixels. The number of physical pixels is therefore
+    each extension's array size times ``pixel_binning`` (the dark current is quoted per
+    *physical* pixel). Since both the event count and the pixel count scale with the
+    analysed area, the rate does not depend on how many rows/columns are kept. When the
+    gain is undefined or the exposure time is non-positive/NaN, the result is NaN.
+
+    Returns a list (one dict per extension) whose keys are the CSV column names in
+    ``_DARK_CURRENT_COLUMN`` for the requested method(s).
+    """
+    methods = _resolve_dark_current_methods(method)
+    valid_exposure = np.isfinite(exposure_days) and exposure_days > 0
+
+    rows = []
+    for ext, gain in enumerate(gains):
+        data = data_ext[ext]
+        n_pixels = np.asarray(data).size * pixel_binning
+        pedestal = pedestals[ext]
+        popt = double_gauss_popts[ext]
+        sigma0_adu = popt[0]  # s: shared peak width (= the pedestal/zero-peak width)
+        mu1 = popt[2]
+
+        def _rate(n_events):
+            if not (np.isfinite(n_events) and valid_exposure and n_pixels > 0):
+                return np.nan
+            return n_events / n_pixels / exposure_days
+
+        def _weighted_rate(fraction):
+            # The 'weighted' method's n_events is the per-image-pixel fraction
+            # N1/(N1+N0), so it must NOT be divided by the pixel count again (that
+            # cancels in the ratio). Converting to a per-*physical*-pixel/day rate only
+            # needs the binning (physical pixels summed per image pixel) and exposure.
+            if not (np.isfinite(fraction) and valid_exposure and pixel_binning > 0):
+                return np.nan
+            return fraction / pixel_binning / exposure_days
+
+        row = {}
+        if 'count' in methods:
+            n_events = _single_electron_count_window(
+                data, pedestal, gain, sigma0_adu, mu1, count_center, count_nsigma)
+            row[_DARK_CURRENT_COLUMN['count']] = _rate(n_events)
+        if 'integrate' in methods:
+            n_events = _single_electron_count_integral(popt, zero_one_edges_ext[ext], gain)
+            row[_DARK_CURRENT_COLUMN['integrate']] = _rate(n_events)
+        if 'weighted' in methods:
+            n_events = _single_electron_count_weighted(popt, gain)
+            row[_DARK_CURRENT_COLUMN['weighted']] = _weighted_rate(n_events)
+        rows.append(row)
+    return rows
+
 #---------------- Per-extension summary (CSV) ----------------------------
 
 # Column order of the per-extension summary. Extends the nonlinearity_studies columns
 # (ext, gain_adu_per_e, noise_e) with noise_adu, the zero-peak width in raw ADU.
 _EXTENSION_SUMMARY_FIELDS = ['ext', 'gain_adu_per_e', 'noise_adu', 'noise_e']
 
-def build_extension_summary(gains, double_gauss_popts):
+def build_extension_summary(gains, double_gauss_popts, dark_current_rows=None,
+                            exposure_days=None, raw_pedestals=None):
     """Per-extension rows of gain (ADU/e-) and noise, in both ADU and e-.
 
     ``noise_adu`` is the zero-electron peak width (``s0``, the first double-Gaussian
     coefficient, in ADU); ``noise_e`` is that same width divided by the gain. When no
     one-electron peak was found the gain is NaN, so noise_e is NaN as well, but
     noise_adu is still reported (it does not depend on the gain).
+
+    When supplied, optional columns are merged in: ``raw_pedestals`` adds
+    ``pedestal_raw_adu`` (the pre-subtraction baseline, see ``raw_pedestal_locations``),
+    ``exposure_days`` adds an ``exposure_days`` column, and ``dark_current_rows`` (from
+    ``calculate_dark_current``) adds the chosen dark-current column(s).
     """
     rows = []
     for ext, gain in enumerate(gains):
         noise_adu = double_gauss_popts[ext][0]  # s0: std of the zero-electron peak in ADU
-        rows.append({
-            'ext': ext + 1,
-            'gain_adu_per_e': gain,
-            'noise_adu': noise_adu,
-            'noise_e': noise_adu / gain,  # ADU -> e- by dividing by gain (ADU/e-)
-        })
+        row = {'ext': ext + 1}
+        if raw_pedestals is not None:
+            row['pedestal_raw_adu'] = raw_pedestals[ext]
+        row['gain_adu_per_e'] = gain
+        row['noise_adu'] = noise_adu
+        row['noise_e'] = noise_adu / gain  # ADU -> e- by dividing by gain (ADU/e-)
+        if exposure_days is not None:
+            row['exposure_days'] = exposure_days
+        if dark_current_rows is not None:
+            row.update(dark_current_rows[ext])
+        rows.append(row)
     return rows
 
-def write_extension_summary_csv(save_path, gains, double_gauss_popts):
-    """Write the per-extension gain/noise summary to ``save_path`` as CSV.
+def _extension_summary_fieldnames(dark_current_rows=None, exposure_days=None,
+                                  raw_pedestals=None):
+    """Ordered CSV field names for the per-extension summary, including the optional
+    raw-pedestal, exposure-time and dark-current columns actually present."""
+    fieldnames = ['ext']
+    if raw_pedestals is not None:
+        fieldnames.append('pedestal_raw_adu')
+    fieldnames += ['gain_adu_per_e', 'noise_adu', 'noise_e']
+    if exposure_days is not None:
+        fieldnames.append('exposure_days')
+    if dark_current_rows:
+        for method in _DARK_CURRENT_METHODS:
+            column = _DARK_CURRENT_COLUMN[method]
+            if any(column in row for row in dark_current_rows):
+                fieldnames.append(column)
+    return fieldnames
+
+def write_extension_summary_csv(save_path, gains, double_gauss_popts,
+                                dark_current_rows=None, exposure_days=None,
+                                raw_pedestals=None):
+    """Write the per-extension gain/noise (and optional dark-current) summary as CSV.
 
     Returns the list of summary rows (see build_extension_summary).
     """
-    rows = build_extension_summary(gains, double_gauss_popts)
+    rows = build_extension_summary(gains, double_gauss_popts, dark_current_rows,
+                                   exposure_days, raw_pedestals)
+    fieldnames = _extension_summary_fieldnames(dark_current_rows, exposure_days,
+                                               raw_pedestals)
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     with save_path.open('w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=_EXTENSION_SUMMARY_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(rows)
     return rows

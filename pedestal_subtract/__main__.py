@@ -29,13 +29,20 @@ from . import __version__
 from .core import (
     _PEDSUB_ALGO_VERSION,
     _PEAKFIND_DENSITY,
+    _SUBPLOTS_FIGSIZE,
     get_fits,
     get_fits_header,
+    get_exposure_time_days,
+    get_pixel_binning,
+    raw_pedestal_locations,
     overscan_cols_from_header,
     pedestal_subtract_ext_cached,
     get_zero_one_peaks_ext,
     _scalar_for_extension,
+    calculate_dark_current,
     plot_zero_one_peaks,
+    plot_dark_current_zero_one,
+    plot_charge_per_column,
     write_extension_summary_csv,
 )
 from .stitch_fits import stitch_fits
@@ -236,8 +243,12 @@ _RUN_HASH_EXCLUDE = {
     'plot_zero_one_individual', 'plot_zero_one_together',
     'plot_zero_one_yscale', 'plot_zero_one_xlim', 'plot_zero_one_ylim',
     'plot_zero_one_individual_figsize', 'plot_zero_one_subplots_figsize',
+    'plot_dark_current_figsize', 'plot_charge_per_column_figsize',
     'plot_zero_one_sharex', 'plot_zero_one_sharey', 'show_titles',
     'electron_fit_mode',
+    'dark_current_method', 'dark_current_count_center', 'dark_current_count_nsigma',
+    'exposure_time_s',
+    'plot_dark_current', 'plot_charge_per_column',
 }
 
 
@@ -343,7 +354,7 @@ def init_argparse(argv=None):
     parser.add_argument("--pedsub_cache_dir", type=str,
                         default=_config_default(config, 'pedsub_cache_dir', None),
                         help="Directory for the pedestal-subtracted FITS cache. "
-                             "Defaults to the source FITS directory.")
+                             "Defaults to a 'cache/' folder beside the source FITS file.")
     parser.add_argument("--force_pedsub", action="store_true",
                         default=_config_default(config, 'force_pedsub', False),
                         help="Recompute pedestal subtraction, ignoring any cache.")
@@ -433,6 +444,23 @@ def init_argparse(argv=None):
                         help="Also produce the electron-units version of the fits.")
     parser.add_argument("--no-plot_zero_one_electrons", dest="plot_zero_one_electrons",
                         action="store_false", help="Disable the electron-units plot.")
+    parser.add_argument("--plot_dark_current", action="store_true",
+                        default=_config_default(config, 'plot_dark_current', True),
+                        help="Plot the electron-unit zero/one distributions with the "
+                             "dark-current count window marked (vertical lines, when the "
+                             "'count' method is used) and a legend of the shared sigma, "
+                             "gain and dark current.")
+    parser.add_argument("--no-plot_dark_current", dest="plot_dark_current",
+                        action="store_false", help="Disable the dark-current window plot.")
+    parser.add_argument("--plot_charge_per_column", action="store_true",
+                        default=_config_default(config, 'plot_charge_per_column', False),
+                        help="Plot the median charge per column for each extension on the raw "
+                             "(pre-pedestal-subtraction) data, with columns whose median is "
+                             ">= n_std_to_mask biweight-SDs from the location flagged red. "
+                             "Every column is plotted; the columns excluded by --fit_cols are "
+                             "shaded light grey.")
+    parser.add_argument("--no-plot_charge_per_column", dest="plot_charge_per_column",
+                        action="store_false", help="Disable the charge-per-column plot.")
     parser.add_argument("--electron_fit_mode", type=str, choices=['transform', 'refit'],
                         default=_config_default(config, 'electron_fit_mode', None),
                         help="How to obtain the electron-unit double-Gaussian curve: "
@@ -479,6 +507,16 @@ def init_argparse(argv=None):
     parser.add_argument("--plot_zero_one_subplots_figsize", nargs=2, type=float,
                         default=_config_default(config, 'plot_zero_one_subplots_figsize', None),
                         metavar=('W', 'H'), help="Figure size for the combined subplot.")
+    parser.add_argument("--plot_dark_current_figsize", nargs=2, type=float,
+                        default=_config_default(config, 'plot_dark_current_figsize', None),
+                        metavar=('W', 'H'),
+                        help=f"Figure size for the dark-current window plot. "
+                             f"Default: the shared subplots size {_SUBPLOTS_FIGSIZE}.")
+    parser.add_argument("--plot_charge_per_column_figsize", nargs=2, type=float,
+                        default=_config_default(config, 'plot_charge_per_column_figsize', None),
+                        metavar=('W', 'H'),
+                        help=f"Figure size for the charge-per-column plot. "
+                             f"Default: the shared subplots size {_SUBPLOTS_FIGSIZE}.")
     parser.add_argument("--plot_zero_one_sharex", action="store_true",
                         default=_config_default(config, 'plot_zero_one_sharex', None),
                         help="Share the x-axis across the 2x2 subplot.")
@@ -512,6 +550,40 @@ def init_argparse(argv=None):
                              "extension_summary.csv in the output directory.")
     parser.add_argument("--no-save_csv", dest="save_csv", action="store_false",
                         help="Do not write the extension_summary.csv file.")
+    parser.add_argument("--dark_current_method", type=str,
+                        choices=['count', 'integrate', 'weighted', 'all'],
+                        default=_config_default(config, 'dark_current_method', 'all'),
+                        help="How to count single-electron events for the dark current "
+                             "(electrons/pixel/day). 'count' counts pixels within one "
+                             "peak sigma of 1 e-; 'integrate' uses the area under the "
+                             "fitted one-electron Gaussian (a conservative upper bound); "
+                             "'weighted' uses the one-electron amplitude fraction "
+                             "n_events = N1/(N1+N0); "
+                             "'all' (default) computes each and writes a column per method "
+                             "so they can be compared.")
+    parser.add_argument("--dark_current_count_center", type=str,
+                        choices=['one_electron', 'mu1'],
+                        default=_config_default(config, 'dark_current_count_center', 'one_electron'),
+                        help="For the 'count' method, where the +/- window is "
+                             "centred: 'one_electron' (default) centres on the ideal 1 e- "
+                             "charge (pedestal + gain); 'mu1' centres on the fitted "
+                             "one-electron peak mean.")
+    parser.add_argument("--dark_current_count_nsigma", type=float,
+                        default=_config_default(config, 'dark_current_count_nsigma', 1.0),
+                        help="Half-width of the 'count' window, in units of the fitted "
+                             "peak width sigma (default 1.0 = +/- 1 sigma). The single "
+                             "shared sigma (the pedestal width) is well-determined even at "
+                             "low statistics. The windowed count is divided by the Gaussian "
+                             "fraction erf(nsigma/sqrt(2)) (0.6827 at +/- 1 sigma) to "
+                             "estimate the full one-electron count. "
+                             "Use a value < 1 to shrink the window and cut zero-peak tail "
+                             "contamination, which dominates the count at low dark current.")
+    parser.add_argument("--exposure_time_s", type=float,
+                        default=_config_default(config, 'exposure_time_s', None),
+                        help="Manually specify the exposure time in SECONDS, overriding the "
+                             "FITS-header value (DATEEND - DATEINI) used for the dark current. "
+                             "Useful when a file's header is missing DATEINI/DATEEND. Converted "
+                             "to days internally. Default: read from the header.")
     parser.add_argument("--show_plots", action="store_true",
                         default=_config_default(config, 'show_plots', True),
                         help="Display plots interactively.")
@@ -552,6 +624,16 @@ def init_argparse(argv=None):
     # argparse's choices only validate CLI strings, so re-check a config-supplied value.
     if args.electron_fit_mode not in (None, 'transform', 'refit'):
         parser.error(f"electron_fit_mode must be 'transform' or 'refit' (got {args.electron_fit_mode!r})")
+    if args.dark_current_method not in ('count', 'integrate', 'weighted', 'all'):
+        parser.error(f"dark_current_method must be 'count', 'integrate', 'weighted', "
+                     f"or 'all' (got {args.dark_current_method!r})")
+    if args.dark_current_count_center not in ('one_electron', 'mu1'):
+        parser.error(f"dark_current_count_center must be 'one_electron' or 'mu1' "
+                     f"(got {args.dark_current_count_center!r})")
+    if float(args.dark_current_count_nsigma) <= 0:
+        parser.error(f"dark_current_count_nsigma must be > 0 "
+                     f"(got {args.dark_current_count_nsigma})")
+    args.dark_current_count_nsigma = float(args.dark_current_count_nsigma)
 
     # Group a flat CLI int list into column pairs (and validate the count) up front, so
     # the stored/snapshotted value is the canonical pair / per-extension form.
@@ -589,7 +671,21 @@ def main(argv=None):
     # tree-wide search fallback for a bare relative name). When stitching, file_string is
     # instead a directory / glob of per-image FITS files, so this check is skipped.
     if not args.stitch_fits:
-        if not file_path.is_absolute() and not file_path.exists():
+        if glob.has_magic(args.file_string):
+            # A glob pattern (e.g. '..._VDD-20p5_*.fz') must be expanded -- otherwise the
+            # literal '*' path never exists and the check below reports "file not found".
+            # The single-file (non-stitch) path analyzes one image, so an ambiguous match
+            # is an error: narrow the pattern or use --stitch_fits to combine the files.
+            matches = sorted(glob.glob(args.file_string))
+            if not matches:
+                print(f'Error: no FITS file matches the pattern: {args.file_string}')
+                sys.exit(1)
+            if len(matches) > 1:
+                print(f'Error: file_string matched {len(matches)} files; narrow the pattern '
+                      'or use --stitch_fits to combine them:\n  ' + '\n  '.join(matches))
+                sys.exit(1)
+            file_path = Path(matches[0])
+        elif not file_path.is_absolute() and not file_path.exists():
             # Search the current tree for a matching filename.
             for found in Path('.').rglob(file_path.name):
                 file_path = found
@@ -676,6 +772,46 @@ def main(argv=None):
     print(f'Analyzing image: {file_path}\n')
     data_ext = get_fits(str(file_path))
 
+    # Capture the pedestal (zero-peak) location from the RAW data, before any
+    # pedestal subtraction, so the reported baseline is the physical pedestal level
+    # rather than the ~0 baseline left after subtraction.
+    raw_pedestals = raw_pedestal_locations(data_ext)
+    # Keep the full raw frame (pedestal subtraction below rebinds data_ext) for the
+    # charge-per-column diagnostic, which is meaningful on the un-subtracted data.
+    raw_data_ext = data_ext
+
+    # Per-extension fit-column slice and stitched-image count, resolved up front so the
+    # raw charge-per-column diagnostic below (and the fit later) both use them.
+    fit_cols_ext = _normalize_fit_cols(args.fit_cols, len(data_ext))
+    nimages = args.nimages
+    if nimages is None:
+        import re
+        match = re.search(r'_(\d+)_stitched', str(file_path))
+        nimages = int(match.group(1)) if match else 1
+
+    # Charge per column is a RAW-data diagnostic and must run BEFORE pedestal subtraction:
+    # the subtraction levels (and its sigma-clip masks) the very anomalous columns this
+    # plot is meant to reveal. It is therefore also the first figure shown.
+    if args.plot_charge_per_column:
+        # Own figsize when configured, else the shared subplots default (13x9).
+        charge_figsize = (tuple(args.plot_charge_per_column_figsize)
+                          if args.plot_charge_per_column_figsize is not None else _SUBPLOTS_FIGSIZE)
+        plot_charge_per_column(
+            raw_data_ext,
+            n_std_to_mask=args.n_std_to_mask,
+            fit_cols_ext=fit_cols_ext,
+            figsize=charge_figsize,
+            additional_title=args.extra_plot_title if args.extra_plot_title else '',
+            show_titles=args.show_titles if args.show_titles is not None else True,
+            nimages=nimages,
+            verbose=args.verbose,
+            save_plots=args.save_plots,
+            show_plots=args.show_plots,
+            fig_path=str(fig_path),
+            file=file_path.name,
+            dpi=350,
+        )
+
     # Per-extension overscan setting: each selected extension estimates its per-row
     # pedestal from the overscan columns only (still subtracted from the full frame);
     # the rest estimate from the full frame.
@@ -716,7 +852,7 @@ def main(argv=None):
     # overscan estimate) still sees the full frame. The fit flattens each extension, so
     # this only changes which pixels enter the zero/one histogram, not the geometry.
     # One (c0, c1) range may be applied to every extension, or one per extension.
-    fit_cols_ext = _normalize_fit_cols(args.fit_cols, len(data_ext))
+    # (fit_cols_ext was resolved above, before pedestal subtraction.)
     if any(fc is not None for fc in fit_cols_ext):
         data_ext = [
             np.asarray(d)[:, fc[0]:fc[1]] if fc is not None else d
@@ -724,13 +860,6 @@ def main(argv=None):
         ]
         if args.verbose:
             print(f'Restricting the fit columns per extension: {fit_cols_ext}')
-
-    # Infer the stitched-image count from the filename unless overridden.
-    nimages = args.nimages
-    if nimages is None:
-        import re
-        match = re.search(r'_(\d+)_stitched', str(file_path))
-        nimages = int(match.group(1)) if match else 1
 
     if args.verbose and fit_params['gain_seed'] is not None:
         # Show the per-extension gain seeds actually applied (resolved with the same
@@ -751,20 +880,85 @@ def main(argv=None):
         gain_seed=fit_params['gain_seed'],
     )
 
-    for ext, (pedestal, gain) in enumerate(zip(pedestals, gains)):
+    # Exposure time (days). A manually configured exposure_time_s (in seconds) overrides
+    # the header value -- e.g. for a file whose FITS header is missing DATEINI/DATEEND;
+    # otherwise read DATEEND - DATEINI from the header (same for a stitched image, since
+    # each pixel was exposed for one image's duration).
+    if args.exposure_time_s is not None:
+        exposure_days = args.exposure_time_s / 86400
+        # The manual value wins, but if the header also carries a valid exposure that
+        # disagrees, flag it -- a mismatch usually means the wrong value was entered.
+        header_days = get_exposure_time_days(file_path)
+        if not np.isnan(header_days) and not np.isclose(
+                header_days * 86400, args.exposure_time_s, rtol=1e-3, atol=0.5):
+            print(f'Warning: manual exposure_time_s ({args.exposure_time_s:.1f} s) conflicts '
+                  f'with the FITS-header DATEEND - DATEINI ({header_days * 86400:.1f} s); '
+                  f'using the manual value.\n')
+        if args.verbose:
+            print(f'Exposure time (manual exposure_time_s): {args.exposure_time_s:.1f} s '
+                  f'-> {exposure_days:.6f} days\n')
+    else:
+        exposure_days = get_exposure_time_days(file_path)
+        if np.isnan(exposure_days):
+            print('Warning: DATEINI/DATEEND not found in the FITS headers; dark current '
+                  'will be NaN. Set exposure_time_s (seconds) in the config to supply it '
+                  'manually.\n')
+        elif args.verbose:
+            total_s = exposure_days * 86400
+            hours = int(total_s // 3600)
+            minutes = int((total_s % 3600) // 60)
+            print(f'Exposure time: {exposure_days:.6f} days / '
+                  f'{hours}hr:{minutes:02d}min / {total_s:.1f} s\n')
+
+    # Pixel binning (NPBIN x NSBIN): each image pixel sums that many physical CCD
+    # pixels, so the dark current (per physical pixel) divides by the binned factor.
+    npbin, nsbin = get_pixel_binning(file_path)
+    if npbin is None or nsbin is None:
+        print(f'Warning: NPBIN/NSBIN not found in the FITS headers (got NPBIN={npbin}, '
+              f'NSBIN={nsbin}); assuming no binning (factor 1) for the dark current.\n')
+    pixel_binning = (npbin or 1) * (nsbin or 1)
+    if args.verbose:
+        print(f'Pixel binning: NPBIN={npbin}, NSBIN={nsbin} -> {pixel_binning} '
+              f'physical pixels per image pixel\n')
+
+    # Per-extension dark current (electrons / physical pixel / day), by the chosen method(s).
+    dark_current_rows = calculate_dark_current(
+        data_ext, pedestals, gains, double_gauss_popts, zero_one_edges_ext,
+        exposure_days, method=args.dark_current_method,
+        count_center=args.dark_current_count_center,
+        count_nsigma=args.dark_current_count_nsigma,
+        pixel_binning=pixel_binning,
+    )
+
+    for ext, gain in enumerate(gains):
         noise = double_gauss_popts[ext][0]
+        raw_pedestal = raw_pedestals[ext]
         if np.isnan(gain):
             # No trustworthy one-electron peak: gain (hence noise in e-) is undefined.
-            print(f'EXT {ext + 1}: pedestal = {pedestal:.4f} ADU, '
+            print(f'EXT {ext + 1}: pedestal (raw) = {raw_pedestal:.4f} ADU, '
                   f'noise = {noise:.4f} ADU, no 1 e- peak found (gain undefined)')
         else:
-            print(f'EXT {ext + 1}: pedestal = {pedestal:.4f} ADU, '
+            print(f'EXT {ext + 1}: pedestal (raw) = {raw_pedestal:.4f} ADU, '
                   f'noise = {noise/gain:.4f} e-, gain = {gain:.4f} ADU/e-')
+        dc = dark_current_rows[ext]
+        dc_parts = []
+        if 'dark_current_count_e_per_pix_day' in dc:
+            dc_parts.append(f"count (±{args.dark_current_count_nsigma:g}σ0) = "
+                            f"{dc['dark_current_count_e_per_pix_day']:.4g}")
+        if 'dark_current_integrate_e_per_pix_day' in dc:
+            dc_parts.append(f"integrate = {dc['dark_current_integrate_e_per_pix_day']:.4g}")
+        if 'dark_current_weighted_e_per_pix_day' in dc:
+            dc_parts.append(f"weighted = {dc['dark_current_weighted_e_per_pix_day']:.4g}")
+        if dc_parts:
+            print(f"         dark current (e-/pix/day): {', '.join(dc_parts)}")
     print()
 
     if args.save_csv:
         summary_csv_path = fig_path / 'extension_summary.csv'
-        write_extension_summary_csv(summary_csv_path, gains, double_gauss_popts)
+        write_extension_summary_csv(summary_csv_path, gains, double_gauss_popts,
+                                    dark_current_rows=dark_current_rows,
+                                    exposure_days=exposure_days,
+                                    raw_pedestals=raw_pedestals)
         print(f'Saved per-extension summary to {summary_csv_path}\n')
 
     if args.plot_zero_one_adu or args.plot_zero_one_electrons:
@@ -797,6 +991,32 @@ def main(argv=None):
             n=fit_params['n'],
             do_plot_adu=args.plot_zero_one_adu,
             do_convert_to_electrons=args.plot_zero_one_electrons,
+            save_plots=args.save_plots,
+            show_plots=args.show_plots,
+            fig_path=str(fig_path),
+            file=file_path.name,
+            dpi=350,
+        )
+
+    if args.plot_dark_current:
+        plot_dark_current_zero_one(
+            data_ext,
+            zero_one_counts_ext,
+            zero_one_edges_ext,
+            pedestals,
+            gains,
+            double_gauss_popts,
+            zero_one_ranges,
+            dark_current_rows,
+            count_center=args.dark_current_count_center,
+            count_nsigma=args.dark_current_count_nsigma,
+            electron_fit_mode=args.electron_fit_mode or 'transform',
+            nimages=nimages,
+            figsize=(tuple(args.plot_dark_current_figsize)
+                     if args.plot_dark_current_figsize is not None else _SUBPLOTS_FIGSIZE),
+            yscale=args.plot_zero_one_yscale or 'log',
+            additional_title=args.extra_plot_title if args.extra_plot_title else '',
+            show_titles=args.show_titles if args.show_titles is not None else True,
             save_plots=args.save_plots,
             show_plots=args.show_plots,
             fig_path=str(fig_path),

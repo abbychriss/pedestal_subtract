@@ -9,7 +9,7 @@ Pipeline
 --------
 1. ``get_fits``                    - load extensions 1-4 from a FITS file.
 2. ``pedestal_subtract_ext_cached``- row/column pedestal-subtract each extension
-                                     (results cached to ``*.pedsub.fits``).
+                                     (results cached to ``*.pedsub.fits`` in a ``cache/`` folder).
 3. ``get_zero_one_peaks_ext``      - fit the zero/one-electron peaks per extension
                                      with a double Gaussian (pedestal, noise, gain).
 4. ``plot_zero_one_peaks``         - plot the double-Gaussian fits in ADU and/or

@@ -12,10 +12,11 @@ Given a FITS image with extensions 1–4 of pixel charge data, this package:
    sigma-clipping to the zero-electron peak core. Optionally, the per-row pedestal
    can be estimated from only the serial-overscan columns (`--use_overscan_only`)
    and still subtracted from the full frame. Results are cached to a
-   `*.pedsub.fits` file next to the source so reruns with the same parameters skip
-   the recompute (`pedestal_subtract_ext_cached`).
-3. **Fits the zero/one-electron peaks** of each extension with a double Gaussian,
-   yielding the pedestal, read noise, and gain (`get_zero_one_peaks_ext`).
+   `*.pedsub.fits` file in a `cache/` folder beside the source so reruns with the
+   same parameters skip the recompute (`pedestal_subtract_ext_cached`).
+3. **Fits the zero/one-electron peaks** of each extension with a double Gaussian whose
+   two peaks share a single width (the read noise), yielding the pedestal, read noise,
+   and gain (`get_zero_one_peaks_ext`).
 4. **Plots** those double-Gaussian fits in ADU and/or electron units, individually
    per extension and/or as a combined 2×2 subplot (`plot_zero_one_peaks`).
 
@@ -82,13 +83,19 @@ python -m pedestal_subtract --help
 | `--fit_cols COL ...` | all columns | Restrict the zero/one fit (and the plotted histograms) to image columns (a Python half-open slice `START:STOP`). Pass two ints (`START STOP`) to apply one range to **every** extension, or two **per** extension (e.g. 8 ints for 4 extensions) for per-extension ranges. Negative endpoints count from the right. In the JSON config use a `[START, STOP]` pair, or a per-extension list of `[START, STOP]`/`null` (e.g. `[[10, -10], null, [10, -10], null]`, where `null` keeps all columns for that extension; `null` endpoints like `[256, null]` give an open-ended slice). Applied **after** pedestal subtraction, so the per-row pedestal / overscan estimate still uses the full frame. Omit to use every column. |
 | `--zero_one_gain_guess GAIN ...` | auto-detect | Seed for the one-electron peak location — a guess for the gain (ADU/e⁻) — used to **initialize** the double-Gaussian fit instead of auto-detecting the one-electron bump. The seed places `μ₁` at `μ₀ + gain` and sizes the fit window / amplitude guess from it; the post-fit acceptance band (gain ∈ [0.5, 1.5] ADU/e⁻) is unchanged. Pass one value to apply it to **every** extension, or one **per** extension (e.g. 4 values for 4 extensions). In the JSON config use a single number or a per-extension list of numbers/`null` (e.g. `[1.05, null, 0.95, 1.1]`, where `null` auto-detects that extension). Values must be > 0. Omit to auto-detect for all. |
 | `--force_pedsub` | off | Recompute, ignoring the on-disk cache. |
-| `--pedsub_cache_dir DIR` | source dir | Where to write the `*.pedsub.fits` cache. |
+| `--pedsub_cache_dir DIR` | `cache/` beside source | Where to write the `*.pedsub.fits` cache. |
 | `-z` / `--plot_zero_one_adu` | on | Plot fits in ADU. |
 | `--plot_zero_one_electrons` | off | Also plot in electron units. |
+| `--plot_dark_current` | on | Plot the electron-unit zero/one distributions with a legend of σ, gain and the dark current(s). When the `count` method is used, the count window is marked by vertical dashed lines (±`dark_current_count_nsigma`·σ about 1 e⁻); when it is not, those lines are omitted and (if the `weighted` method is used) the legend instead reports the weighted dark current and its formula `n_events = N₁/(N₁+N₀)`. |
+| `--plot_charge_per_column` | off | Plot the median charge per column for each extension (2×2 grid) on the **raw**, pre-pedestal-subtraction data — a diagnostic for anomalous columns. A column whose median sits ≥ `--n_std_to_mask` biweight-SDs from the extension's biweight location is flagged "hot" (drawn red). Every column is plotted; the columns **excluded** by `--fit_cols` are shaded light grey so the masked-out region is visible. With `--verbose`, the hot columns per extension are also printed. |
 | `--electron_fit_mode` | `transform` | How the electron-unit curve is obtained. `transform` analytically rescales the converged ADU fit (exact; μ₀ = 0 / μ₁ = 1 by construction, no refit). `refit` fits the double Gaussian again directly to the electron-unit histogram, letting the peaks/widths re-optimise in electron space (widths kept positive, amplitudes non-negative, means free; falls back to the transform if the refit fails). Only affects the electron-units plot. |
 | `--plot_zero_one_yscale` | `linear` | `linear` or `log`. |
 | `-s` / `--save_plots` | off | Save plots to `--output_dir`. |
-| `--save_csv` | off | Write a per-extension `extension_summary.csv` (columns `ext`, `gain_adu_per_e`, `noise_adu`, `noise_e`) into the run's output folder. `noise_adu` is the zero-peak width (σ₀) in ADU; `noise_e` is that width divided by the gain. For an extension with no one-electron peak, `gain_adu_per_e` and `noise_e` are `nan`, but `noise_adu` is still reported (it does not depend on the gain). |
+| `--save_csv` | off | Write a per-extension `extension_summary.csv` (columns `ext`, `pedestal_raw_adu`, `gain_adu_per_e`, `noise_adu`, `noise_e`, `exposure_days`, and the chosen dark-current column(s)) into the run's output folder. `pedestal_raw_adu` is the median pedestal location of the **raw** data, before pedestal subtraction. `noise_adu` is the shared peak width (σ) in ADU; `noise_e` is that width divided by the gain. For an extension with no one-electron peak, `gain_adu_per_e` and `noise_e` are `nan`, but `noise_adu` is still reported (it does not depend on the gain). |
+| `--dark_current_method` | `all` | How to count single-electron events for the **dark current** (electrons / physical pixel / day = single-electron events ÷ physical pixels ÷ exposure-days, where physical pixels = image pixels × NPBIN × NSBIN, since the detector is read out binned and each image pixel sums NPBIN×NSBIN physical pixels). `count` counts pixels within `dark_current_count_nsigma` peak widths σ of the 1 e⁻ charge, then divides by the Gaussian fraction `erf(nsigma ⁄ √2)` (0.6827 at ±1σ) to estimate the **full** one-electron count, bringing it into agreement with the other two methods (the single shared σ, the pedestal width, is well-determined even at low statistics; the zero-peak tail is **not** subtracted, since those pixels can't be physically distinguished from real 1 e⁻ events). `integrate` uses the analytic area under the fitted one-electron Gaussian, `N₁·σ·√(2π) ⁄ bin-width` (a conservative upper bound, sensitive to the fit). `weighted` uses the one-electron amplitude fraction `n_events = N₁ ⁄ (N₁ + N₀)`, which is already per image pixel; its rate is therefore `N₁ ⁄ (N₁ + N₀) ⁄ (NPBIN·NSBIN) ⁄ exposure-days` — divided only by the pixel binning and exposure, **not** by the pixel count (which cancels in the ratio). `all` (default) computes each and writes a column per method (`dark_current_count_e_per_pix_day`, `dark_current_integrate_e_per_pix_day`, `dark_current_weighted_e_per_pix_day`) so they can be compared. The exposure time is `DATEEND − DATEINI` from the FITS header (or `--exposure_time_s` when set) — unchanged for a stitched image, since each pixel was exposed for one image's duration. When the gain is undefined or the exposure can't be read, the dark current is `nan`. |
+| `--dark_current_count_center` | `one_electron` | For the `count` method, where the window is centred: `one_electron` (default) on the ideal 1 e⁻ charge (`pedestal + gain`), or `mu1` on the fitted one-electron peak mean μ₁. |
+| `--dark_current_count_nsigma` | `1.0` | Half-width of the `count` window in units of the fitted peak width σ (default `1.0` = ±1σ). The single shared σ (the pedestal width) stays well-determined at low statistics. Use `< 1` to shrink the window and cut the zero-peak tail contamination that dominates the count at low dark current. The rate itself does **not** depend on how many rows/columns are analysed (event count and pixel count scale together), so the charge-window width — not the spatial extent — is the knob for tail contamination. |
+| `--exposure_time_s` | from header | Manually set the exposure time in **seconds**, overriding the FITS-header `DATEEND − DATEINI`. Use when a file's header is missing `DATEINI`/`DATEEND` (so the dark current would otherwise be `nan`). Converted to days internally. In the JSON config use `null` to read from the header (the default). |
 | `--no-show_plots` | (shows) | Don't open figures interactively. |
 
 When saving to disk, each run is stored in a unique subfolder named with a short
@@ -155,11 +162,13 @@ as in `nonlinearity_studies`. The keys this package consumes:
 `zero_one_n_bins`, `zero_one_window_left_scale`, `zero_one_window_right_scale`,
 `zero_one_peakfind_density`, `zero_one_gain_guess`, `fit_cols`,
 `pedsub_cache_dir`, `force_pedsub`, `use_biweight_loc`, `use_biweight_midvar`,
-`plot_zero_one_adu`, `plot_zero_one_electrons`, `electron_fit_mode`, `plot_zero_one_individual`,
+`plot_zero_one_adu`, `plot_zero_one_electrons`, `plot_dark_current`, `plot_charge_per_column`, `electron_fit_mode`, `plot_zero_one_individual`,
 `plot_zero_one_together`, `plot_zero_one_yscale`, `plot_zero_one_individual_figsize`,
-`plot_zero_one_subplots_figsize`, `plot_zero_one_sharex`, `plot_zero_one_sharey`,
-`extra_plot_title`, `nimages`, `show_titles`, `save_plots`, `save_csv`, `show_plots`,
-`output_dir`, `verbose`.
+`plot_zero_one_subplots_figsize`, `plot_dark_current_figsize`, `plot_charge_per_column_figsize`,
+`plot_zero_one_sharex`, `plot_zero_one_sharey`,
+`extra_plot_title`, `nimages`, `show_titles`, `save_plots`, `save_csv`,
+`dark_current_method`, `dark_current_count_center`, `dark_current_count_nsigma`,
+`exposure_time_s`, `show_plots`, `output_dir`, `verbose`.
 
 `use_overscan_only`, `overscan_cols`, `fit_cols`, and `zero_one_gain_guess` are additions
 specific to this package (not present in `nonlinearity_studies`); older configs without
