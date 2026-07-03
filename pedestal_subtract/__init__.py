@@ -20,6 +20,20 @@ Run as a module::
     python -m pedestal_subtract IMAGE.fits
 
 Use ``python -m pedestal_subtract --help`` for all options.
+
+Code layout (organized by responsibility)
+------------------------------------------
+- ``double_gauss_model`` : the double-Gaussian model function.
+- ``calibrate``          : ADU->electron conversion and noise/gain calculation.
+- ``fit_zero_one``       : histogramming and zero/one-electron peak fitting.
+- ``pedestal``           : pedestal subtraction, overscan handling, and caching.
+- ``fits_io``            : FITS loading and header/geometry readers.
+- ``dark_current``       : dark-current estimation methods.
+- ``plotting``           : zero/one, dark-current, and charge-per-column figures.
+- ``summary``            : per-extension summary tables (CSV).
+- ``__main__``           : command-line entry point (``cli_config`` holds its
+                           config/argument helpers).
+- ``core``               : backwards-compatibility shim re-exporting everything above.
 """
 
 __version__ = "0.1.0"

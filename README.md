@@ -20,6 +20,23 @@ Given a FITS image with extensions 1–4 of pixel charge data, this package:
 4. **Plots** those double-Gaussian fits in ADU and/or electron units, individually
    per extension and/or as a combined 2×2 subplot (`plot_zero_one_peaks`).
 
+## Code structure
+
+The package is organized by responsibility rather than as one large `core` module:
+
+- `double_gauss_model.py` — the double-Gaussian model function
+- `calibrate.py` — ADU→electron conversion and noise/gain calculation
+- `fit_zero_one.py` — histogramming and zero/one-electron peak fitting
+- `pedestal.py` — pedestal subtraction, overscan handling, and caching
+- `fits_io.py` — FITS loading and header/geometry readers
+- `dark_current.py` — dark-current estimation methods
+- `plotting.py` — zero/one, dark-current, and charge-per-column figures
+- `summary.py` — per-extension summary tables (CSV)
+- `__main__.py` — command-line entry point; `cli_config.py` holds its config/argument helpers
+- `core.py` — backwards-compatibility shim that re-exports the full public API, so existing `from pedestal_subtract.core import ...` imports keep working
+
+FITS stitching lives in the shared `analysis_tools` package.
+
 ## Installation
 
 From this directory (`pedestal_subtract/`, the one containing `pyproject.toml`):

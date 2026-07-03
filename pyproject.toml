@@ -27,6 +27,7 @@ dependencies = [
     "scipy>=1.5.0",
     "astropy>=4.0",
     "tqdm>=4.0",
+    "analysis_tools @ git+https://github.com/abbychriss/analysis_tools.git",
 ]
 
 [project.optional-dependencies]
