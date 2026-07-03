@@ -1181,7 +1181,7 @@ def plot_zero_one_peaks(data_ext,
 #---------------- Plotting: dark-current window ----------------------------
 
 def _dark_current_fit_label(sigma_e, gain, N1):
-    """Legend text for the red fit curve: shared width (e-), gain, and 1 e- amplitude N1."""
+    """Legend text for the fit curve: shared width (e-), gain, and 1 e- amplitude N1."""
     return (r'$\sigma$ = %.3f $e^-$' % sigma_e
             + '\n' + r'gain = %.3f ADU/$e^-$, $N_1$ = %.4g' % (gain, N1))
 
@@ -1197,13 +1197,16 @@ def plot_dark_current_zero_one(data_ext, zero_one_counts_ext, zero_one_edges_ext
     """Plot the electron-unit zero/one distributions with the dark-current count window.
 
     One subplot per extension (2x2): the electron-unit histogram and fitted
-    double-Gaussian curve, and a legend with the shared sigma, the gain and the dark
-    current(s). When the 'count' method was used, vertical dashed lines mark the
-    +/- ``count_nsigma`` * sigma charge window it integrates around 1 e-; otherwise
-    those lines are omitted and (when the 'weighted' method was used) the legend
-    instead reports that method's dark current and its formula. Extensions with no
-    one-electron peak (gain undefined) cannot be converted to electrons and are left
-    with an explanatory note.
+    double-Gaussian curve, with one independent legend entry per dark-current method
+    actually present in ``dark_current_rows`` for that extension (the shared-sigma/
+    gain/N1 fit-curve entry is always shown in addition). When the 'count' method was
+    used, vertical dashed lines mark the +/- ``count_nsigma`` * sigma charge window it
+    integrates around 1 e-. When the 'integrate' method was used, the area under the
+    fitted one-electron Gaussian component is shaded. When the 'weighted' method was
+    used, its dark current and formula are reported as a legend-only entry. Any
+    combination of these may appear together (up to 4 legend entries total).
+    Extensions with no one-electron peak (gain undefined) cannot be converted to
+    electrons and are left with an explanatory note.
     """
     fig_path = Path(fig_path)
     base_name = Path(file).stem + '_dark_current' if file != 'dark_current' else file
@@ -1248,6 +1251,8 @@ def plot_dark_current_zero_one(data_ext, zero_one_counts_ext, zero_one_edges_ext
         ax.plot(curve_x_e, double_gauss(curve_x_e, *popt_e), '#8dde1b',
                 label=_dark_current_fit_label(sigma_e, gain, N1))
 
+        # Each dark-current method actually present in dark_current_rows gets its own,
+        # independent legend entry -- these are not mutually exclusive.
         dc_count = dark_current_rows[ext].get('dark_current_count_e_per_pix_day')
         if dc_count is not None:
             # 'count' method was used: draw its +/- count_nsigma * sigma window about the
@@ -1259,18 +1264,29 @@ def plot_dark_current_zero_one(data_ext, zero_one_counts_ext, zero_one_edges_ext
             center_adu = popt[2] if count_center == 'mu1' else pedestal + gain
             lo_e = (center_adu - count_nsigma * sigma_adu - pedestal) / gain
             hi_e = (center_adu + count_nsigma * sigma_adu - pedestal) / gain
-            window_label = (rf'count window ($\pm${count_nsigma:g}$\,\sigma$)'
+            window_label = (rf'count (window $\pm${count_nsigma:g}$\,\sigma$)'
                             + '\n' + r'dark current = %.3g $e^-$/pix/day' % dc_count)
             ax.axvline(lo_e, color='k', linestyle=':', linewidth=1.2, label=window_label)
             ax.axvline(hi_e, color='k', linestyle=':', linewidth=1.2)
-        else:
-            # 'count' not used: no window lines. If the 'weighted' method was used,
-            # report its dark current and formula as a legend-only entry.
-            dc_weighted = dark_current_rows[ext].get('dark_current_weighted_e_per_pix_day')
-            if dc_weighted is not None:
-                ax.plot([], [], ' ',
-                        label=(r'dark current = %.3g $e^-$/pix/day' % dc_weighted
-                               + '\n' + r'$n_{events}$ / img $ = N_1$ / $(N_1 + N_0)$'))
+
+        dc_integrate = dark_current_rows[ext].get('dark_current_integrate_e_per_pix_day')
+        if dc_integrate is not None:
+            # 'integrate' method was used: shade the area under the fitted one-electron
+            # Gaussian component (reusing popt_e/curve_x_e from the fit curve above, so
+            # the shading matches it exactly) and label it with the method's dark current.
+            one_e_curve = popt_e[4] * np.exp(-(curve_x_e - popt_e[2])**2 / (2 * popt_e[0]**2))
+            integrate_label = (r'integrate (1$e^-$ Gaussian)'
+                               + '\n' + r'dark current = %.3g $e^-$/pix/day' % dc_integrate)
+            ax.fill_between(curve_x_e, one_e_curve, color='#ff7f0e', alpha=0.4,
+                            label=integrate_label)
+
+        dc_weighted = dark_current_rows[ext].get('dark_current_weighted_e_per_pix_day')
+        if dc_weighted is not None:
+            # 'weighted' method was used: report its dark current and formula as a
+            # legend-only entry (no corresponding visual element).
+            ax.plot([], [], ' ',
+                    label=(r'weighted (SER = $N_1$ / $(N_1 + N_0)$)' \
+                           + '\n' + 'dark current = %.3g $e^-$/pix/day' % dc_weighted))
 
         ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
         ax.legend(loc='upper right', fontsize=fontsize - 2)
@@ -1565,13 +1581,21 @@ _DARK_CURRENT_COLUMN = {
 _DARK_CURRENT_METHODS = ('count', 'integrate', 'weighted')
 
 def _resolve_dark_current_methods(method):
-    """Methods to compute, from a 'count'/'integrate'/'weighted'/'all' selector."""
-    if method == 'all':
+    """Methods to compute, from a 'count'/'integrate'/'weighted'/'all' selector, or a
+    list/tuple of those (each entry may also be 'all'). Returned in stable canonical
+    (``_DARK_CURRENT_METHODS``) order regardless of input order, so CSV columns stay
+    deterministic."""
+    items = (method,) if isinstance(method, str) else tuple(method)
+    if not items:
+        raise ValueError("dark current method must include at least one of 'count', "
+                         "'integrate', 'weighted', or 'all'; got an empty selection")
+    bad = [m for m in items if m not in _DARK_CURRENT_METHODS and m != 'all']
+    if bad:
+        raise ValueError("dark current method must be one of 'count', 'integrate', "
+                         f"'weighted', or 'all'; got invalid value(s) {bad!r}")
+    if 'all' in items:
         return _DARK_CURRENT_METHODS
-    if method in _DARK_CURRENT_METHODS:
-        return (method,)
-    raise ValueError("dark current method must be one of 'count', 'integrate', "
-                     f"'weighted', or 'all'; got {method!r}")
+    return tuple(m for m in _DARK_CURRENT_METHODS if m in items)
 
 def _single_electron_count_window(data, pedestal, gain, sigma0_adu, mu1, count_center,
                                   nsigma=1.0):
@@ -1678,8 +1702,9 @@ def calculate_dark_current(data_ext, pedestals, gains, double_gauss_popts,
       rate is ``N1/(N1+N0) / pixel_binning / exposure_days`` -- divided only by the
       binning and exposure, NOT by the pixel count (which cancels in the ratio).
 
-    ``method`` may be ``'count'``, ``'integrate'``, ``'weighted'`` or ``'all'`` -- only
-    the requested method(s) are computed.
+    ``method`` may be a single ``'count'``/``'integrate'``/``'weighted'``/``'all'``
+    selector, or a list/tuple of any combination of those (``'all'`` expands to every
+    method wherever it appears) -- only the requested method(s) are computed.
 
     The detector is read out binned, so each image pixel sums ``pixel_binning``
     (= NPBIN * NSBIN) physical CCD pixels. The number of physical pixels is therefore

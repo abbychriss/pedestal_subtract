@@ -117,6 +117,18 @@ def _coerce_gain_guess(value):
     return value
 
 
+def _coerce_dark_current_method(value):
+    """Coerce a raw --dark_current_method / config value into a list of method names.
+
+    The CLI always yields a list (nargs='+'). A JSON config may instead give a bare
+    string (old single-method format, e.g. "weighted"), wrapped into a single-element
+    list here so both forms feed _resolve_dark_current_methods identically.
+    """
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
 def _normalize_fit_cols(fit_cols, n_ext):
     """Resolve fit_cols into one ``(c0, c1)``-or-None entry per extension.
 
@@ -550,17 +562,18 @@ def init_argparse(argv=None):
                              "extension_summary.csv in the output directory.")
     parser.add_argument("--no-save_csv", dest="save_csv", action="store_false",
                         help="Do not write the extension_summary.csv file.")
-    parser.add_argument("--dark_current_method", type=str,
-                        choices=['count', 'integrate', 'weighted', 'all'],
-                        default=_config_default(config, 'dark_current_method', 'all'),
+    parser.add_argument("--dark_current_method", nargs='+', type=str,
+                        default=_config_default(config, 'dark_current_method', ['all']),
+                        metavar='METHOD',
                         help="How to count single-electron events for the dark current "
-                             "(electrons/pixel/day). 'count' counts pixels within one "
-                             "peak sigma of 1 e-; 'integrate' uses the area under the "
-                             "fitted one-electron Gaussian (a conservative upper bound); "
-                             "'weighted' uses the one-electron amplitude fraction "
-                             "n_events = N1/(N1+N0); "
-                             "'all' (default) computes each and writes a column per method "
-                             "so they can be compared.")
+                             "(electrons/pixel/day). One or more of 'count' (pixels "
+                             "within one peak sigma of 1 e-), 'integrate' (area under "
+                             "the fitted one-electron Gaussian, a conservative upper "
+                             "bound), 'weighted' (the one-electron amplitude fraction "
+                             "N1/(N1+N0)), or 'all' (every method; default). Pass "
+                             "multiple values to compute several at once, e.g. "
+                             "--dark_current_method count weighted; each writes its "
+                             "own CSV column so they can be compared.")
     parser.add_argument("--dark_current_count_center", type=str,
                         choices=['one_electron', 'mu1'],
                         default=_config_default(config, 'dark_current_count_center', 'one_electron'),
@@ -624,9 +637,15 @@ def init_argparse(argv=None):
     # argparse's choices only validate CLI strings, so re-check a config-supplied value.
     if args.electron_fit_mode not in (None, 'transform', 'refit'):
         parser.error(f"electron_fit_mode must be 'transform' or 'refit' (got {args.electron_fit_mode!r})")
-    if args.dark_current_method not in ('count', 'integrate', 'weighted', 'all'):
-        parser.error(f"dark_current_method must be 'count', 'integrate', 'weighted', "
-                     f"or 'all' (got {args.dark_current_method!r})")
+    args.dark_current_method = _coerce_dark_current_method(args.dark_current_method)
+    _bad_dc_methods = [m for m in args.dark_current_method
+                       if m not in ('count', 'integrate', 'weighted', 'all')]
+    if _bad_dc_methods:
+        parser.error(f"dark_current_method must be one or more of 'count', 'integrate', "
+                     f"'weighted', or 'all' (got invalid value(s) {_bad_dc_methods!r})")
+    if not args.dark_current_method:
+        parser.error("dark_current_method must include at least one of 'count', "
+                     "'integrate', 'weighted', or 'all'")
     if args.dark_current_count_center not in ('one_electron', 'mu1'):
         parser.error(f"dark_current_count_center must be 'one_electron' or 'mu1' "
                      f"(got {args.dark_current_count_center!r})")
