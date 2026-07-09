@@ -7,7 +7,9 @@ such as `from ...core import name` keep working unchanged.
 """
 
 from .constants import (
-    _PEAKFIND_DENSITY,
+    _ZERO_ONE_N_BINS,
+    _GAIN_SEED_FIT_MARGIN,
+    _ZERO_PEAK_LEFT_FIT_NSIGMA,
     _MIN_GAIN_ADU,
     _MAX_GAIN_ADU,
     _DARK_CURRENT_COLUMN,
@@ -24,7 +26,7 @@ from .calibrate import (
 from .fit_zero_one import (
     _smooth_counts,
     _GAIN_FIT_MARGIN,
-    _peakfind_bins,
+    _clamp_n_bins,
     _make_histogram,
     _estimate_peak_width,
     _clip_to_bounds,
@@ -84,7 +86,9 @@ from .summary import (
 )
 
 __all__ = [
-    "_PEAKFIND_DENSITY",
+    "_ZERO_ONE_N_BINS",
+    "_GAIN_SEED_FIT_MARGIN",
+    "_ZERO_PEAK_LEFT_FIT_NSIGMA",
     "_MIN_GAIN_ADU",
     "_MAX_GAIN_ADU",
     "_DARK_CURRENT_COLUMN",
@@ -95,7 +99,7 @@ __all__ = [
     "calculate_noise_gain",
     "_smooth_counts",
     "_GAIN_FIT_MARGIN",
-    "_peakfind_bins",
+    "_clamp_n_bins",
     "_make_histogram",
     "_estimate_peak_width",
     "_clip_to_bounds",

@@ -8,6 +8,7 @@ import inspect
 import json
 import numpy as np
 from .core import plot_zero_one_peaks
+from .constants import _DEFAULT_DARK_CURRENT_METHOD
 from pathlib import Path
 
 def _overscan_ext_indices(value, n_ext):
@@ -76,8 +77,12 @@ def _coerce_dark_current_method(value):
 
     The CLI always yields a list (nargs='+'). A JSON config may instead give a bare
     string (old single-method format, e.g. "weighted"), wrapped into a single-element
-    list here so both forms feed _resolve_dark_current_methods identically.
+    list here so both forms feed _resolve_dark_current_methods identically. A null
+    value in the config (or the key being absent, which reaches here as None via the
+    argparse default) selects the default method (_DEFAULT_DARK_CURRENT_METHOD).
     """
+    if value is None:
+        return [_DEFAULT_DARK_CURRENT_METHOD]
     if isinstance(value, str):
         return [value]
     return list(value)
@@ -181,28 +186,19 @@ def _window_scale(value):
 
 
 def _n_bins(value):
-    """argparse type for the zero/one histogram bin count: an integer >= 10
-    (the double-Gaussian has 6 free parameters, so fewer bins is ill-posed)."""
-    f = int(value)
-    if f < 10:
-        raise argparse.ArgumentTypeError(f"must be an integer >= 10 (got {f})")
-    return f
-
-
-def _peakfind_density(value):
-    """argparse type for the peak-finding histogram density (bins per ADU): a
-    number >= 1, used only to locate the zero/one peaks, independent of the
-    fit/plot bin count set by --zero_one_n_bins."""
-    f = float(value)
-    if f < 1.0:
-        raise argparse.ArgumentTypeError(f"must be >= 1 (got {f})")
-    return f
+    """argparse type for the single zero/one binning knob: a strict integer number of
+    bins (>= 1) used for both the peak finder and the double-Gaussian fit/plot,
+    independently of the fit-window scales or the gain guess."""
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1 (got {n})")
+    return n
 
 
 # Args that should NOT influence the run-identity hash: anything that only
 # affects display/output (not the pedestal-subtracted data or the fit results).
 _RUN_HASH_EXCLUDE = {
-    'config', 'json', 'verbose', 'save_plots', 'save_csv', 'output_dir', 'show_plots',
+    'config', 'json', 'verbose', 'save_output', 'output_dir', 'show_plots',
     'pedsub_cache_dir', 'force_pedsub',
     'extra_plot_title', 'nimages',
     'plot_zero_one_adu', 'plot_zero_one_electrons',
@@ -212,6 +208,7 @@ _RUN_HASH_EXCLUDE = {
     'plot_dark_current_figsize', 'plot_charge_per_column_figsize',
     'plot_zero_one_sharex', 'plot_zero_one_sharey', 'show_titles',
     'electron_fit_mode',
+    'do_dark_current',
     'dark_current_method', 'dark_current_count_center', 'dark_current_count_nsigma',
     'exposure_time_s',
     'plot_dark_current', 'plot_charge_per_column',

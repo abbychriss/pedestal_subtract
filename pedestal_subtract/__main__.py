@@ -26,7 +26,7 @@ from pathlib import Path
 from . import __version__
 from .core import (
     _PEDSUB_ALGO_VERSION,
-    _PEAKFIND_DENSITY,
+    _ZERO_ONE_N_BINS,
     _SUBPLOTS_FIGSIZE,
     get_fits,
     get_fits_header,
@@ -56,7 +56,6 @@ from .cli_config import (
     _config_default,
     _window_scale,
     _n_bins,
-    _peakfind_density,
     _PLOT_ARG_TO_PARAM,
     _effective_args_dict,
     _run_hash,
@@ -159,11 +158,6 @@ def init_argparse(argv=None):
                         help="Use std dev for the per-line scale.")
 
     # ----- Fit window -----
-    parser.add_argument("--zero_one_n_bins", type=_n_bins,
-                        default=_config_default(config, 'zero_one_n_bins', 100),
-                        help="Number of bins spanning the zero/one fit window at window "
-                             "scale 1.0 (the count scales up automatically when the window "
-                             "is widened, keeping bin width constant). Integer >= 10. Default 100.")
     parser.add_argument("--zero_one_window_left_scale", type=_window_scale,
                         default=_config_default(config, 'zero_one_window_left_scale', 1.0),
                         help="Scale the left half-width of the auto-computed zero/one fit "
@@ -172,12 +166,15 @@ def init_argparse(argv=None):
                         default=_config_default(config, 'zero_one_window_right_scale', 1.0),
                         help="Scale the right half-width of the auto-computed zero/one fit "
                              "window (>=1.0; >1 widens past the one-electron peak). Default 1.0.")
-    parser.add_argument("--zero_one_peakfind_density", type=_peakfind_density,
-                        default=_config_default(config, 'zero_one_peakfind_density', _PEAKFIND_DENSITY),
-                        help="Bins-per-ADU of the internal histograms used to LOCATE the zero/one "
-                             "peaks (separate from --zero_one_n_bins, which sets the fit/plot bins). "
-                             "Raise for finer detection, lower to aggregate sparse low-statistics "
-                             f"hits. Number >= 1. Default {_PEAKFIND_DENSITY}.")
+    parser.add_argument("--zero_one_n_bins", type=_n_bins,
+                        default=_config_default(config, 'zero_one_n_bins', _ZERO_ONE_N_BINS),
+                        help="The single zero/one binning knob: a strict number of bins used for "
+                             "BOTH the peak finder and the double-Gaussian fit/plot histogram. Every "
+                             "window (test range, peak-search range, fit window) is divided into this "
+                             "many bins, so widening the window (e.g. via the scales) coarsens the "
+                             "bin width instead of adding bins. Raise for finer bins, lower to "
+                             "aggregate sparse low-statistics hits. "
+                             f"Integer >= 1. Default {_ZERO_ONE_N_BINS}.")
     parser.add_argument("--fit_cols", nargs='+', type=int,
                         default=_config_default(config, 'fit_cols', None),
                         metavar='COL',
@@ -309,27 +306,36 @@ def init_argparse(argv=None):
                         help="Draw plot titles.")
     parser.add_argument("--no-show_titles", dest="show_titles", action="store_false",
                         help="Hide plot titles.")
-    parser.add_argument("-s", "--save_plots", action="store_true",
-                        default=_config_default(config, 'save_plots', False),
-                        help="Save plots to the output directory.")
-    parser.add_argument("--save_csv", action="store_true",
-                        default=_config_default(config, 'save_csv', False),
-                        help="Save a per-extension gain/noise summary as "
-                             "extension_summary.csv in the output directory.")
-    parser.add_argument("--no-save_csv", dest="save_csv", action="store_false",
-                        help="Do not write the extension_summary.csv file.")
+    parser.add_argument("-s", "--save_output", action="store_true",
+                        default=_config_default(config, 'save_output', False),
+                        help="Save plots and the per-extension gain/noise summary "
+                             "(extension_summary.csv) to the output directory.")
+    parser.add_argument("--no-save_output", dest="save_output", action="store_false",
+                        help="Do not save plots or extension_summary.csv.")
+    parser.add_argument("--do_dark_current", action="store_true",
+                        default=_config_default(config, 'do_dark_current', True),
+                        help="Compute the per-extension dark current (default on). Use "
+                             "--no-do_dark_current (or \"do_dark_current\": false in the "
+                             "config) to skip the dark-current calculation and its plot "
+                             "entirely; the summary CSV then omits the dark-current "
+                             "column(s).")
+    parser.add_argument("--no-do_dark_current", dest="do_dark_current",
+                        action="store_false",
+                        help="Skip the dark-current calculation and plot.")
     parser.add_argument("--dark_current_method", nargs='+', type=str,
-                        default=_config_default(config, 'dark_current_method', ['all']),
+                        default=_config_default(config, 'dark_current_method', None),
                         metavar='METHOD',
                         help="How to count single-electron events for the dark current "
                              "(electrons/pixel/day). One or more of 'count' (pixels "
                              "within one peak sigma of 1 e-), 'integrate' (area under "
                              "the fitted one-electron Gaussian, a conservative upper "
                              "bound), 'weighted' (the one-electron amplitude fraction "
-                             "N1/(N1+N0)), or 'all' (every method; default). Pass "
+                             "N1/(N1+N0)), or 'all' (every method). Pass "
                              "multiple values to compute several at once, e.g. "
                              "--dark_current_method count weighted; each writes its "
-                             "own CSV column so they can be compared.")
+                             "own CSV column so they can be compared. A null config "
+                             "value (or omitting the key) selects the default method, "
+                             "'weighted'.")
     parser.add_argument("--dark_current_count_center", type=str,
                         choices=['one_electron', 'mu1'],
                         default=_config_default(config, 'dark_current_count_center', 'one_electron'),
@@ -357,7 +363,7 @@ def init_argparse(argv=None):
                         default=_config_default(config, 'show_plots', True),
                         help="Display plots interactively.")
     parser.add_argument("--no-show_plots", dest="show_plots", action="store_false",
-                        help="Do not display plots (useful with --save_plots).")
+                        help="Do not display plots (useful with --save_output).")
     parser.add_argument("-o", "--output_dir", type=str,
                         default=_config_default(config, 'output_dir', None),
                         help="Directory for saved plots. Defaults to a 'plots' folder "
@@ -383,12 +389,9 @@ def init_argparse(argv=None):
     for _scale_arg in ('zero_one_window_left_scale', 'zero_one_window_right_scale'):
         if getattr(args, _scale_arg) < 1.0:
             parser.error(f"{_scale_arg} must be >= 1.0 (got {getattr(args, _scale_arg)})")
-    if int(args.zero_one_n_bins) < 10:
-        parser.error(f"zero_one_n_bins must be an integer >= 10 (got {args.zero_one_n_bins})")
+    if int(args.zero_one_n_bins) < 1:
+        parser.error(f"zero_one_n_bins must be >= 1 (got {args.zero_one_n_bins})")
     args.zero_one_n_bins = int(args.zero_one_n_bins)
-    if float(args.zero_one_peakfind_density) < 1.0:
-        parser.error(f"zero_one_peakfind_density must be >= 1 (got {args.zero_one_peakfind_density})")
-    args.zero_one_peakfind_density = float(args.zero_one_peakfind_density)
 
     # argparse's choices only validate CLI strings, so re-check a config-supplied value.
     if args.electron_fit_mode not in (None, 'transform', 'refit'):
@@ -512,12 +515,11 @@ def main(argv=None):
     # Hardcoded parameters that affect the fit results (not display). Defined here
     # so they are both passed to the fit and recorded in the run snapshot.
     fit_params = {
-        'n': args.zero_one_n_bins,
+        'n_bins': args.zero_one_n_bins,
         'fit_bounds': 'default',
         'zero_one_test_range': 'auto',
         'window_left_scale': args.zero_one_window_left_scale,
         'window_right_scale': args.zero_one_window_right_scale,
-        'peakfind_density': args.zero_one_peakfind_density,
         'gain_seed': args.zero_one_gain_guess,
     }
 
@@ -527,7 +529,7 @@ def main(argv=None):
 
     # Only materialize the run directory (and its config snapshot) when there is
     # something to save into it; interactive-only runs leave no directory behind.
-    if args.save_plots or args.save_csv:
+    if args.save_output:
         fig_path.mkdir(parents=True, exist_ok=True)
         config_snapshot_path = fig_path / 'config.json'
         snapshot = {
@@ -541,8 +543,7 @@ def main(argv=None):
         with open(config_snapshot_path, 'w', encoding='utf-8') as f:
             json.dump(snapshot, f, indent=2, sort_keys=True, default=str)
         print(f'Config snapshot saved to {config_snapshot_path}')
-        if args.save_plots:
-            print(f'Plots will be saved to {fig_path}')
+        print(f'Plots and extension_summary.csv will be saved to {fig_path}')
 
     print(f'Analyzing image: {file_path}\n')
     data_ext = get_fits(str(file_path))
@@ -580,7 +581,7 @@ def main(argv=None):
             show_titles=args.show_titles if args.show_titles is not None else True,
             nimages=nimages,
             verbose=args.verbose,
-            save_plots=args.save_plots,
+            save_plots=args.save_output,
             show_plots=args.show_plots,
             fig_path=str(fig_path),
             file=file_path.name,
@@ -646,12 +647,11 @@ def main(argv=None):
     (zero_one_counts_ext, zero_one_edges_ext, pedestals, gains,
      double_gauss_popts, zero_one_ranges) = get_zero_one_peaks_ext(
         data_ext,
-        n=fit_params['n'],
+        n_bins=fit_params['n_bins'],
         fit_bounds=fit_params['fit_bounds'],
         zero_one_test_range=fit_params['zero_one_test_range'],
         window_left_scale=fit_params['window_left_scale'],
         window_right_scale=fit_params['window_right_scale'],
-        peakfind_density=fit_params['peakfind_density'],
         gain_seed=fit_params['gain_seed'],
     )
 
@@ -696,14 +696,19 @@ def main(argv=None):
         print(f'Pixel binning: NPBIN={npbin}, NSBIN={nsbin} -> {pixel_binning} '
               f'physical pixels per image pixel\n')
 
-    # Per-extension dark current (electrons / physical pixel / day), by the chosen method(s).
-    dark_current_rows = calculate_dark_current(
-        data_ext, pedestals, gains, double_gauss_popts, zero_one_edges_ext,
-        exposure_days, method=args.dark_current_method,
-        count_center=args.dark_current_count_center,
-        count_nsigma=args.dark_current_count_nsigma,
-        pixel_binning=pixel_binning,
-    )
+    # Per-extension dark current (electrons / physical pixel / day), by the chosen
+    # method(s). Skipped entirely when --no-do_dark_current / "do_dark_current": false:
+    # dark_current_rows stays None so the summary CSV and plot omit the column(s).
+    if args.do_dark_current:
+        dark_current_rows = calculate_dark_current(
+            data_ext, pedestals, gains, double_gauss_popts, zero_one_edges_ext,
+            exposure_days, method=args.dark_current_method,
+            count_center=args.dark_current_count_center,
+            count_nsigma=args.dark_current_count_nsigma,
+            pixel_binning=pixel_binning,
+        )
+    else:
+        dark_current_rows = None
 
     for ext, gain in enumerate(gains):
         noise = double_gauss_popts[ext][0]
@@ -715,6 +720,8 @@ def main(argv=None):
         else:
             print(f'EXT {ext + 1}: pedestal (raw) = {raw_pedestal:.4f} ADU, '
                   f'noise = {noise/gain:.4f} e-, gain = {gain:.4f} ADU/e-')
+        if dark_current_rows is None:
+            continue
         dc = dark_current_rows[ext]
         dc_parts = []
         if 'dark_current_count_e_per_pix_day' in dc:
@@ -728,7 +735,7 @@ def main(argv=None):
             print(f"         dark current (e-/pix/day): {', '.join(dc_parts)}")
     print()
 
-    if args.save_csv:
+    if args.save_output:
         summary_csv_path = fig_path / 'extension_summary.csv'
         write_extension_summary_csv(summary_csv_path, gains, double_gauss_popts,
                                     dark_current_rows=dark_current_rows,
@@ -763,17 +770,16 @@ def main(argv=None):
             suptitle='Double-Gaussian Fit to Zero-One Electron Peaks',
             nimages=nimages,
             fontsize=12,
-            n=fit_params['n'],
             do_plot_adu=args.plot_zero_one_adu,
             do_convert_to_electrons=args.plot_zero_one_electrons,
-            save_plots=args.save_plots,
+            save_plots=args.save_output,
             show_plots=args.show_plots,
             fig_path=str(fig_path),
             file=file_path.name,
             dpi=350,
         )
 
-    if args.plot_dark_current:
+    if args.plot_dark_current and dark_current_rows is not None:
         plot_dark_current_zero_one(
             data_ext,
             zero_one_counts_ext,
@@ -792,7 +798,7 @@ def main(argv=None):
             yscale=args.plot_zero_one_yscale or 'log',
             additional_title=args.extra_plot_title if args.extra_plot_title else '',
             show_titles=args.show_titles if args.show_titles is not None else True,
-            save_plots=args.save_plots,
+            save_plots=args.save_output,
             show_plots=args.show_plots,
             fig_path=str(fig_path),
             file=file_path.name,
