@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import numpy as np
+from analysis_tools import compute_hot_columns
 from .core import plot_zero_one_peaks
 from .constants import _DEFAULT_DARK_CURRENT_METHOD
 from pathlib import Path
@@ -31,26 +32,61 @@ def _overscan_ext_indices(value, n_ext):
     return set(range(n_ext))
 
 
-def _coerce_fit_cols(value):
-    """Coerce a raw --fit_cols / config value into None, a [c0, c1] pair, or a list of
-    per-extension None/[c0, c1] entries.
+def _is_int_token(v):
+    """True when ``v`` is (or spells) a plain integer -- e.g. ``8``, ``'8'``, ``'-8'``.
 
-    The CLI passes a flat list of ints -- two (one range for every extension) or two per
-    extension (e.g. 8 for 4 extensions) -- while a JSON config may instead give a single
-    [c0, c1] pair or a per-extension list whose entries are [c0, c1] or null. A flat,
-    even-length int list is grouped into pairs here so both forms feed
-    ``_normalize_fit_cols`` identically. Raises ``ValueError`` on an odd int count.
+    Used to tell the legacy bare-integer --fit_cols form (``8 615``) apart from the
+    slice-string / keyword form (``'0:3200,3400:3500'``, ``'auto'``). ``bool`` is
+    excluded so ``True``/``False`` are never mistaken for integers.
+    """
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, np.integer)):
+        return True
+    if isinstance(v, str):
+        s = v.strip()
+        if s[:1] in ('+', '-'):
+            s = s[1:]
+        return s.isdigit()
+    return False
+
+
+def _coerce_fit_cols(value):
+    """Coerce a raw --fit_cols / config value into the canonical form consumed by
+    ``_normalize_fit_cols``: ``None``, ``'auto'``, a ``[c0, c1]`` pair, a slice-string
+    (``'lo:hi,lo:hi'``), or a per-extension list of any of those (``null`` = all columns).
+
+    The CLI passes a list of string tokens (``type=str``, ``nargs='+'``). Three forms are
+    accepted there and normalized here so both CLI and JSON feed ``_normalize_fit_cols``
+    identically:
+
+    * All tokens are bare integers -- the legacy form. Two ints (one range for every
+      extension) or two per extension (e.g. 8 ints for 4 extensions) are grouped into
+      ``[c0, c1]`` pairs. Raises ``ValueError`` on an odd int count.
+    * A single non-integer token -- a slice-string or ``'auto'`` broadcast to every
+      extension (e.g. ``'0:3200,3400:3500'``).
+    * Several non-integer tokens -- one spec per extension; ``'null'``/``'none'`` (any
+      case) becomes ``None`` (all columns for that extension).
+
+    A JSON config passes the already-structured value (``'auto'``, a slice-string, a
+    ``[c0, c1]`` pair, or a per-extension list), which is returned essentially unchanged.
     """
     if value is None:
         return None
-    if isinstance(value, (list, tuple)) and value and all(
-            isinstance(v, (int, np.integer)) for v in value):
-        if len(value) % 2 != 0:
-            raise ValueError(
-                f'--fit_cols needs an even number of integers (START STOP per extension); '
-                f'got {len(value)}')
-        pairs = [[int(value[i]), int(value[i + 1])] for i in range(0, len(value), 2)]
-        return pairs[0] if len(pairs) == 1 else pairs
+    if isinstance(value, (list, tuple)) and value:
+        # Legacy bare-integer form: group the flat list into [c0, c1] pairs.
+        if all(_is_int_token(v) for v in value):
+            if len(value) % 2 != 0:
+                raise ValueError(
+                    f'--fit_cols needs an even number of integers (START STOP per '
+                    f'extension) when given as bare integers; got {len(value)}')
+            ints = [int(v) for v in value]
+            pairs = [[ints[i], ints[i + 1]] for i in range(0, len(ints), 2)]
+            return pairs[0] if len(pairs) == 1 else pairs
+        # String / keyword form: map 'null'/'none' to None; unwrap a lone broadcast token.
+        tokens = [None if (isinstance(v, str) and v.strip().lower() in ('null', 'none'))
+                  else v for v in value]
+        return tokens[0] if len(tokens) == 1 else tokens
     return value
 
 
@@ -88,28 +124,124 @@ def _coerce_dark_current_method(value):
     return list(value)
 
 
-def _normalize_fit_cols(fit_cols, n_ext):
-    """Resolve fit_cols into one ``(c0, c1)``-or-None entry per extension.
+def _as_endpoint(v):
+    """A single slice endpoint as ``int`` or ``None`` (open end). Accepts ints, or
+    strings that are an integer or blank/``none``/``null`` (an omitted endpoint)."""
+    if v is None:
+        return None
+    if isinstance(v, (int, np.integer)) and not isinstance(v, bool):
+        return int(v)
+    s = str(v).strip()
+    if s == '' or s.lower() in ('none', 'null'):
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        raise ValueError(f'fit_cols endpoint {v!r} is not an integer')
 
-    Accepts ``None`` (all columns everywhere), a single ``(c0, c1)`` pair (applied to
-    every extension), or a length-``n_ext`` list whose entries are each ``None`` (all
-    columns for that extension) or a ``(c0, c1)`` pair. Mirrors
+
+def _parse_region(part):
+    """Parse one ``'START:STOP'`` region string into a ``(lo, hi)`` endpoint pair.
+
+    Both endpoints are optional (``'3400:'`` = to the end, ``':3200'`` = from the start),
+    and negative values count from the right, matching Python half-open slice semantics.
+    """
+    if ':' not in part:
+        raise ValueError(
+            f'fit_cols region {part!r} must be "START:STOP" (a half-open column slice; '
+            f'either end may be blank, e.g. "3400:" or ":3200")')
+    lo_s, hi_s = part.split(':', 1)
+    return (_as_endpoint(lo_s), _as_endpoint(hi_s))
+
+
+def _parse_ext_spec(spec):
+    """Parse one extension's fit_cols spec into ``None``, ``'auto'``, or a list of
+    ``(lo, hi)`` keep-regions.
+
+    ``spec`` may be ``None`` / ``'null'`` / ``'none'`` (keep all columns), ``'auto'``
+    (keep all but the hot columns), a ``[c0, c1]`` pair (a single keep-region), or a
+    comma-separated slice-string such as ``'0:3200,3400:3500'`` (a union of keep-regions).
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        s = spec.strip()
+        if s.lower() in ('', 'null', 'none'):
+            return None
+        if s.lower() == 'auto':
+            return 'auto'
+        regions = [_parse_region(p.strip()) for p in s.split(',') if p.strip()]
+        return regions or None
+    if isinstance(spec, (list, tuple)) and len(spec) == 2:
+        return [(_as_endpoint(spec[0]), _as_endpoint(spec[1]))]
+    raise ValueError(
+        f'fit_cols entry must be null, "auto", a [START, STOP] pair, or a "lo:hi,lo:hi" '
+        f'region string; got {spec!r}')
+
+
+def _normalize_fit_cols(fit_cols, n_ext):
+    """Resolve the canonical fit_cols value into one spec per extension.
+
+    Each returned entry is ``None`` (keep all columns), ``'auto'`` (keep all but the hot
+    columns), or a list of ``(lo, hi)`` half-open keep-regions. Accepts ``None`` (all
+    columns everywhere), ``'auto'`` or a slice-string (broadcast to every extension), a
+    single ``(c0, c1)`` pair (broadcast), or a length-``n_ext`` per-extension list whose
+    entries are each ``None`` / ``'auto'`` / a slice-string / a ``(c0, c1)`` pair.
+    ``_resolve_fit_col_masks`` later turns these specs into per-column keep-masks (which
+    needs the data, for the ``'auto'`` hot-column computation). Mirrors
     ``core._normalize_overscan_cols_ext``.
     """
     if fit_cols is None:
         return [None] * n_ext
     # Explicit per-extension list (checked first so an n_ext-extension file isn't mistaken
-    # for a single range): every entry must be None or a 2-sequence.
+    # for a single range): every entry must be None, a string, or a [c0, c1] 2-sequence.
+    # A bare int is not a valid entry, so a [c0, c1] broadcast pair falls through below.
     if isinstance(fit_cols, (list, tuple)) and len(fit_cols) == n_ext and all(
-            o is None or (isinstance(o, (list, tuple)) and len(o) == 2) for o in fit_cols):
-        return [tuple(o) if o is not None else None for o in fit_cols]
-    # A single (c0, c1) range -> apply to every extension.
+            o is None or isinstance(o, str)
+            or (isinstance(o, (list, tuple)) and len(o) == 2
+                and all(x is None or (isinstance(x, (int, np.integer))
+                                      and not isinstance(x, bool)) for x in o))
+            for o in fit_cols):
+        return [_parse_ext_spec(o) for o in fit_cols]
+    # 'auto' or a slice-string -> broadcast to every extension.
+    if isinstance(fit_cols, str):
+        return [_parse_ext_spec(fit_cols)] * n_ext
+    # A single (c0, c1) range -> broadcast to every extension.
     if isinstance(fit_cols, (list, tuple)) and len(fit_cols) == 2 and all(
-            v is None or isinstance(v, (int, np.integer)) for v in fit_cols):
-        return [tuple(fit_cols)] * n_ext
+            v is None or (isinstance(v, (int, np.integer)) and not isinstance(v, bool))
+            for v in fit_cols):
+        return [_parse_ext_spec(list(fit_cols))] * n_ext
     raise ValueError(
-        f'fit_cols must be null, a [START, STOP] pair, or a length-{n_ext} list of '
-        f'null/[START, STOP]; got {fit_cols!r}')
+        f'fit_cols must be null, "auto", a [START, STOP] pair, a "lo:hi,lo:hi" region '
+        f'string, or a length-{n_ext} per-extension list of those; got {fit_cols!r}')
+
+
+def _resolve_fit_col_masks(fit_cols_ext, data_ext, n_std_to_mask):
+    """Turn per-extension fit_cols specs into per-extension column keep-masks (or None).
+
+    ``None`` keeps every column (returned as ``None`` so the caller can skip slicing).
+    ``'auto'`` keeps every column except the hot ones (median charge >= ``n_std_to_mask``
+    biweight SDs from the extension's location -- the same columns ``plot_charge_per_column``
+    draws red), computed from ``data_ext`` (the raw, pre-pedestal-subtraction frame). A
+    list of ``(lo, hi)`` regions keeps the union of those half-open column slices.
+    """
+    hot_ext = None
+    masks = []
+    for ext, (spec, data) in enumerate(zip(fit_cols_ext, data_ext)):
+        if spec is None:
+            masks.append(None)
+            continue
+        ncol = np.asarray(data).shape[1]
+        if spec == 'auto':
+            if hot_ext is None:
+                hot_ext = compute_hot_columns(data_ext, n_std_to_mask)
+            masks.append(~np.asarray(hot_ext[ext], dtype=bool))
+            continue
+        keep = np.zeros(ncol, dtype=bool)
+        for lo, hi in spec:
+            keep[lo:hi] = True
+        masks.append(keep)
+    return masks
 
 
 def _derive_data_path(file_path_str):
@@ -204,14 +336,16 @@ _RUN_HASH_EXCLUDE = {
     'plot_zero_one_adu', 'plot_zero_one_electrons',
     'plot_zero_one_individual', 'plot_zero_one_together',
     'plot_zero_one_yscale', 'plot_zero_one_xlim', 'plot_zero_one_ylim',
+    'plot_zero_one_ylim_electrons',
     'plot_zero_one_individual_figsize', 'plot_zero_one_subplots_figsize',
     'plot_dark_current_figsize', 'plot_charge_per_column_figsize',
+    'plot_charge_per_column_individual_figsize',
     'plot_zero_one_sharex', 'plot_zero_one_sharey', 'show_titles',
     'electron_fit_mode',
     'do_dark_current',
     'dark_current_method', 'dark_current_count_center', 'dark_current_count_nsigma',
     'exposure_time_s',
-    'plot_dark_current', 'plot_charge_per_column',
+    'plot_dark_current', 'plot_charge_per_column_together', 'plot_charge_per_column_individual',
 }
 
 

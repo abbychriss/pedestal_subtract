@@ -28,6 +28,7 @@ from .core import (
     _PEDSUB_ALGO_VERSION,
     _ZERO_ONE_N_BINS,
     _SUBPLOTS_FIGSIZE,
+    _INDIVIDUAL_FIGSIZE,
     get_fits,
     get_fits_header,
     get_exposure_time_days,
@@ -50,6 +51,7 @@ from .cli_config import (
     _coerce_gain_guess,
     _coerce_dark_current_method,
     _normalize_fit_cols,
+    _resolve_fit_col_masks,
     _derive_data_path,
     _wildcard_free_base,
     _load_config,
@@ -175,18 +177,24 @@ def init_argparse(argv=None):
                              "bin width instead of adding bins. Raise for finer bins, lower to "
                              "aggregate sparse low-statistics hits. "
                              f"Integer >= 1. Default {_ZERO_ONE_N_BINS}.")
-    parser.add_argument("--fit_cols", nargs='+', type=int,
+    parser.add_argument("--fit_cols", nargs='+', type=str,
                         default=_config_default(config, 'fit_cols', None),
-                        metavar='COL',
+                        metavar='SPEC',
                         help="Restrict the zero/one fit (and the plotted histograms) to image "
-                             "columns (a Python half-open slice START:STOP). Pass two ints "
-                             "(START STOP) to apply one range to every extension, or two per "
-                             "extension (e.g. 8 ints for 4 extensions) for per-extension ranges. "
-                             "Negative endpoints count from the right. Applied after pedestal "
-                             "subtraction, so the pedestal still uses the full frame/overscan. Omit "
-                             "to use all columns. In the JSON config use a [START, STOP] pair, or a "
-                             "per-extension list of [START, STOP]/null (null = all columns for that "
-                             "extension; null endpoints like [256, null] give an open-ended slice).")
+                             "columns. A column region is a Python half-open slice START:STOP "
+                             "(either end may be blank -- '3400:' to the end, ':3200' from the "
+                             "start; negative endpoints count from the right); join several with "
+                             "commas to keep their union, e.g. '0:3200,3400:3500'. Pass 'auto' to "
+                             "keep every column except the hot ones (median charge >= n_std_to_mask "
+                             "biweight SDs from the pedestal location -- the columns drawn red by "
+                             "--plot_charge_per_column). Give one value to apply it to every "
+                             "extension, or one per extension (use 'null' for an extension to keep "
+                             "all its columns). Bare integers still work for a single range (two "
+                             "ints for all extensions, or two per extension). Applied after "
+                             "pedestal subtraction, so the pedestal still uses the full "
+                             "frame/overscan. Omit to use all columns. In the JSON config use "
+                             "'auto', a 'lo:hi,lo:hi' string, a [START, STOP] pair, or a "
+                             "per-extension list of those/null.")
     parser.add_argument("--zero_one_gain_guess", nargs='+', type=float,
                         default=_config_default(config, 'zero_one_gain_guess', None),
                         metavar='GAIN',
@@ -217,15 +225,21 @@ def init_argparse(argv=None):
                              "gain and dark current.")
     parser.add_argument("--no-plot_dark_current", dest="plot_dark_current",
                         action="store_false", help="Disable the dark-current window plot.")
-    parser.add_argument("--plot_charge_per_column", action="store_true",
-                        default=_config_default(config, 'plot_charge_per_column', False),
+    parser.add_argument("--plot_charge_per_column_together", action="store_true",
+                        default=_config_default(config, 'plot_charge_per_column_together', False),
                         help="Plot the median charge per column for each extension on the raw "
                              "(pre-pedestal-subtraction) data, with columns whose median is "
-                             ">= n_std_to_mask biweight-SDs from the location flagged red. "
-                             "Every column is plotted; the columns excluded by --fit_cols are "
-                             "shaded light grey.")
-    parser.add_argument("--no-plot_charge_per_column", dest="plot_charge_per_column",
-                        action="store_false", help="Disable the charge-per-column plot.")
+                             ">= n_std_to_mask biweight-SDs from the location flagged red, as a "
+                             "combined 2x2 grid. Every column is plotted; the columns excluded "
+                             "by --fit_cols are shaded light grey.")
+    parser.add_argument("--no-plot_charge_per_column_together", dest="plot_charge_per_column_together",
+                        action="store_false", help="Disable the combined charge-per-column plot.")
+    parser.add_argument("--plot_charge_per_column_individual", action="store_true",
+                        default=_config_default(config, 'plot_charge_per_column_individual', False),
+                        help="Same as --plot_charge_per_column_together, but draws one figure "
+                             "per extension instead of a combined 2x2 grid.")
+    parser.add_argument("--no-plot_charge_per_column_individual", dest="plot_charge_per_column_individual",
+                        action="store_false", help="Disable the individual charge-per-column plots.")
     parser.add_argument("--electron_fit_mode", type=str, choices=['transform', 'refit'],
                         default=_config_default(config, 'electron_fit_mode', None),
                         help="How to obtain the electron-unit double-Gaussian curve: "
@@ -280,8 +294,13 @@ def init_argparse(argv=None):
     parser.add_argument("--plot_charge_per_column_figsize", nargs=2, type=float,
                         default=_config_default(config, 'plot_charge_per_column_figsize', None),
                         metavar=('W', 'H'),
-                        help=f"Figure size for the charge-per-column plot. "
+                        help=f"Figure size for the combined charge-per-column plot. "
                              f"Default: the shared subplots size {_SUBPLOTS_FIGSIZE}.")
+    parser.add_argument("--plot_charge_per_column_individual_figsize", nargs=2, type=float,
+                        default=_config_default(config, 'plot_charge_per_column_individual_figsize', None),
+                        metavar=('W', 'H'),
+                        help=f"Figure size for the individual charge-per-column plots. "
+                             f"Default: the shared individual size {_INDIVIDUAL_FIGSIZE}.")
     parser.add_argument("--plot_zero_one_sharex", action="store_true",
                         default=_config_default(config, 'plot_zero_one_sharex', None),
                         help="Share the x-axis across the 2x2 subplot.")
@@ -556,9 +575,13 @@ def main(argv=None):
     # charge-per-column diagnostic, which is meaningful on the un-subtracted data.
     raw_data_ext = data_ext
 
-    # Per-extension fit-column slice and stitched-image count, resolved up front so the
-    # raw charge-per-column diagnostic below (and the fit later) both use them.
-    fit_cols_ext = _normalize_fit_cols(args.fit_cols, len(data_ext))
+    # Per-extension fit-column selection and stitched-image count, resolved up front so
+    # the raw charge-per-column diagnostic below (and the fit later) both use them. The
+    # spec (None / 'auto' / keep-regions per extension) is resolved into concrete
+    # per-column keep-masks here, using the RAW frame so 'auto' flags the same hot columns
+    # the charge-per-column plot draws red.
+    fit_cols_spec = _normalize_fit_cols(args.fit_cols, len(data_ext))
+    fit_cols_ext = _resolve_fit_col_masks(fit_cols_spec, raw_data_ext, args.n_std_to_mask)
     nimages = args.nimages
     if nimages is None:
         import re
@@ -568,15 +591,20 @@ def main(argv=None):
     # Charge per column is a RAW-data diagnostic and must run BEFORE pedestal subtraction:
     # the subtraction levels (and its sigma-clip masks) the very anomalous columns this
     # plot is meant to reveal. It is therefore also the first figure shown.
-    if args.plot_charge_per_column:
-        # Own figsize when configured, else the shared subplots default (13x9).
-        charge_figsize = (tuple(args.plot_charge_per_column_figsize)
+    if args.plot_charge_per_column_together or args.plot_charge_per_column_individual:
+        # Own figsizes when configured, else the shared defaults.
+        charge_subplots_figsize = (tuple(args.plot_charge_per_column_figsize)
                           if args.plot_charge_per_column_figsize is not None else _SUBPLOTS_FIGSIZE)
+        charge_individual_figsize = (tuple(args.plot_charge_per_column_individual_figsize)
+                          if args.plot_charge_per_column_individual_figsize is not None else _INDIVIDUAL_FIGSIZE)
         plot_charge_per_column(
             raw_data_ext,
             n_std_to_mask=args.n_std_to_mask,
             fit_cols_ext=fit_cols_ext,
-            figsize=charge_figsize,
+            subplots_figsize=charge_subplots_figsize,
+            individual_figsize=charge_individual_figsize,
+            plot_together=args.plot_charge_per_column_together,
+            plot_individual=args.plot_charge_per_column_individual,
             additional_title=args.extra_plot_title if args.extra_plot_title else '',
             show_titles=args.show_titles if args.show_titles is not None else True,
             nimages=nimages,
@@ -627,15 +655,17 @@ def main(argv=None):
     # configured. Done after pedestal subtraction so the per-row pedestal (and any
     # overscan estimate) still sees the full frame. The fit flattens each extension, so
     # this only changes which pixels enter the zero/one histogram, not the geometry.
-    # One (c0, c1) range may be applied to every extension, or one per extension.
-    # (fit_cols_ext was resolved above, before pedestal subtraction.)
+    # fit_cols_ext is a per-extension boolean column keep-mask (or None = keep all),
+    # resolved above from the fit_cols spec before pedestal subtraction.
     if any(fc is not None for fc in fit_cols_ext):
         data_ext = [
-            np.asarray(d)[:, fc[0]:fc[1]] if fc is not None else d
-            for d, fc in zip(data_ext, fit_cols_ext)
+            np.asarray(d)[:, mask] if mask is not None else d
+            for d, mask in zip(data_ext, fit_cols_ext)
         ]
         if args.verbose:
-            print(f'Restricting the fit columns per extension: {fit_cols_ext}')
+            kept = [int(m.sum()) if m is not None else None for m in fit_cols_ext]
+            print(f'Restricting the fit columns per extension: spec={fit_cols_spec}, '
+                  f'kept_columns={kept}')
 
     if args.verbose and fit_params['gain_seed'] is not None:
         # Show the per-extension gain seeds actually applied (resolved with the same

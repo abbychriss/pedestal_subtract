@@ -8,6 +8,8 @@ from astropy.stats import biweight_midvariance
 from pathlib import Path
 from scipy.optimize import curve_fit
 
+from analysis_tools import plot_charge_per_column
+
 from .calibrate import convert_to_electrons
 from .double_gauss_model import double_gauss
 
@@ -582,69 +584,3 @@ def plot_dark_current_zero_one(data_ext, zero_one_counts_ext, zero_one_edges_ext
         print(f'Saved plot to {output_path}')
     _finish_fig(show_plots)
 
-
-def plot_charge_per_column(data_ext, n_std_to_mask=1.5, fit_cols_ext=None,
-                           figsize=_SUBPLOTS_FIGSIZE, additional_title='', show_titles=True,
-                           nimages=1, verbose=False, save_plots=False, show_plots=True,
-                           fig_path='./', file='charge_per_column', dpi=350):
-    """Median charge per column for each extension, as a 2x2 grid of scatter plots.
-
-    Intended for the *raw* (pre-pedestal-subtraction) data, so the per-column medians
-    reveal which columns carry anomalous charge. A column is flagged "hot" (drawn red)
-    when its median sits at least ``n_std_to_mask`` biweight standard deviations from
-    the biweight location of the extension -- the same robust threshold the pedestal
-    subtraction uses to mask outliers. Every column is plotted; ``fit_cols_ext``, if
-    given, is a per-extension ``(c0, c1)`` slice (or None) marking which columns the
-    zero/one fit keeps -- the columns *outside* it are shaded light grey, so the plot
-    shows the full frame while making the masked-out region visible.
-    """
-    fig_path = Path(fig_path)
-    base_name = Path(file).stem + '_charge_per_column' if file != 'charge_per_column' else file
-
-    fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
-    if show_titles:
-        fig.suptitle(f'{additional_title}Median Charge per Column (Nimages = {nimages})')
-
-    for ext, data in enumerate(data_ext):
-        ax = axes.flat[ext]
-        data = np.asarray(data)
-        col_idx = np.arange(data.shape[1])
-        median_charge = np.median(data, axis=0)
-
-        flat = data.flatten()
-        loc = biweight_location(flat, ignore_nan=True)
-        scale = np.sqrt(biweight_midvariance(flat, ignore_nan=True))
-        hot = np.abs(median_charge - loc) >= n_std_to_mask * scale
-
-        ax.scatter(col_idx[~hot], median_charge[~hot], s=1)
-        ax.scatter(col_idx[hot], median_charge[hot], s=1, color='red')
-
-        # Shade the columns excluded by fit_cols (Python-slice semantics handle negative
-        # or None endpoints). Each maximal run of excluded columns is one grey span, so a
-        # left and/or right cut both show; nothing is drawn when all columns are kept.
-        fc = fit_cols_ext[ext] if fit_cols_ext is not None else None
-        if fc is not None:
-            kept = np.zeros(data.shape[1], dtype=bool)
-            kept[fc[0]:fc[1]] = True
-            edges = np.diff(np.concatenate(([0], (~kept).astype(np.int8), [0])))
-            for start, end in zip(np.where(edges == 1)[0], np.where(edges == -1)[0]):
-                ax.axvspan(start - 0.5, end - 0.5, color='gray', alpha=0.15, linewidth=0)
-
-        if show_titles:
-            ax.set_title(f'EXT {ext + 1}')
-        if ext % 2 == 0:        # left column of the grid
-            ax.set_ylabel('Median Charge (ADU)')
-        if ext // 2 == 1:       # bottom row of the grid
-            ax.set_xlabel('Column')
-
-        if verbose:
-            pct = 100 * hot.sum() / len(hot) if len(hot) else 0.0
-            print(f'EXT {ext + 1}: {int(hot.sum())} hot columns ({pct:.1f}%) '
-                  f'(median charge >= {n_std_to_mask} SDs from pedestal location): '
-                  f'{col_idx[hot].tolist()}')
-
-    if save_plots:
-        output_path = fig_path / f'{base_name}.jpeg'
-        plt.savefig(str(output_path), dpi=dpi)
-        print(f'Saved plot to {output_path}')
-    _finish_fig(show_plots)
