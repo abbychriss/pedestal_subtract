@@ -165,11 +165,11 @@ def plot_zero_one_peaks(data_ext,
                         fontsize=9.5,
                         yscale='linear',
                         n=100,
-                        do_convert_to_electrons=False,
                         electron_fit_mode='transform',
-                        plot_individual=False,
-                        plot_together=True,
-                        do_plot_adu=True,
+                        plot_adu_individual=False,
+                        plot_adu_together=True,
+                        plot_electrons_individual=False,
+                        plot_electrons_together=True,
                         sharex=False,
                         sharey=False,
                         show_titles=True,
@@ -189,8 +189,8 @@ def plot_zero_one_peaks(data_ext,
     else:
         base_name = file
 
-    if plot_individual:
-        for ext, data in (enumerate(data_ext) if do_plot_adu else []):
+    if plot_adu_individual:
+        for ext, data in enumerate(data_ext):
             data = np.array(data).flatten()
 
             zero_one_counts=zero_one_counts_ext[ext]
@@ -239,231 +239,229 @@ def plot_zero_one_peaks(data_ext,
                 print(f'Saved plots to {output_path}')
             _finish_fig(show_plots)
 
-        if do_convert_to_electrons:
-            for ext, data in enumerate(data_ext):
-                data=np.array(data).flatten()
-                zero_one_range = zero_one_ranges[ext]
-                pedestal = pedestals[ext]
-                gain = gains[ext]
+    if plot_electrons_individual:
+        for ext, data in enumerate(data_ext):
+            data=np.array(data).flatten()
+            zero_one_range = zero_one_ranges[ext]
+            pedestal = pedestals[ext]
+            gain = gains[ext]
 
-                # No one-electron peak -> no gain -> electron conversion (divide by
-                # gain) is undefined; skip the electron plot for this extension.
-                if np.isnan(gain):
-                    continue
+            # No one-electron peak -> no gain -> electron conversion (divide by
+            # gain) is undefined; skip the electron plot for this extension.
+            if np.isnan(gain):
+                continue
 
-                data_window=data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
+            data_window=data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
 
-                data_window_e = convert_to_electrons(data_window, pedestal, gain)
-                zero_one_range_e = convert_to_electrons(zero_one_range, pedestal, gain)
-                # Match the (scale-adjusted) ADU fit-window bin count so the electron
-                # plot keeps the same bins-to-window ratio when the window is widened.
-                nbins = len(zero_one_counts_ext[ext])
+            data_window_e = convert_to_electrons(data_window, pedestal, gain)
+            zero_one_range_e = convert_to_electrons(zero_one_range, pedestal, gain)
+            # Match the (scale-adjusted) ADU fit-window bin count so the electron
+            # plot keeps the same bins-to-window ratio when the window is widened.
+            nbins = len(zero_one_counts_ext[ext])
 
-                # Window histogram (drawn as the bars).
-                zero_one_counts_e, zero_one_edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
-                zero_one_centers_e = 0.5 * (zero_one_edges_e[:-1] + zero_one_edges_e[1:])
-                window_max_e = np.max(zero_one_counts_e)
+            # Window histogram (drawn as the bars).
+            zero_one_counts_e, zero_one_edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
+            zero_one_centers_e = 0.5 * (zero_one_edges_e[:-1] + zero_one_edges_e[1:])
+            window_max_e = np.max(zero_one_counts_e)
 
-                # Electron-unit curve: the ADU fit rescaled exactly, or a direct refit in
-                # electron units (see electron_fit_mode / _electron_double_gauss_popt).
-                double_gauss_popt_e = _electron_double_gauss_popt(
-                    double_gauss_popts[ext], pedestal, gain,
-                    zero_one_centers_e, zero_one_counts_e, electron_fit_mode)
+            # Electron-unit curve: the ADU fit rescaled exactly, or a direct refit in
+            # electron units (see electron_fit_mode / _electron_double_gauss_popt).
+            double_gauss_popt_e = _electron_double_gauss_popt(
+                double_gauss_popts[ext], pedestal, gain,
+                zero_one_centers_e, zero_one_counts_e, electron_fit_mode)
 
-                fig, ax = plt.subplots(1, 1, figsize=individual_figsize, constrained_layout=True)
-                if show_titles:
-                    ax.set_title(rf'{additional_title}{suptitle} (Nimages = {nimages}): EXT {ext + 1}', fontsize=12, pad=10)
-
-                if yscale=='log':
-                    ax.set_yscale('log')
-                elif yscale!='linear':
-                    ax.set_yscale(yscale)
-
-                ax.stairs(_bar_heights(zero_one_counts_e, yscale), zero_one_edges_e, fill=True)
-                ax.set_xlabel(r'Charge ($e^–$)')
-                ax.set_ylabel('N')
-                curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(zero_one_counts_e))
-                ax.plot(curve_x_e, double_gauss(curve_x_e, *double_gauss_popt_e), 'r',
-                    label=r'$\sigma$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:3]
-                    +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
-                ax.legend(loc="upper right", fontsize=fontsize)
-
-                if xlim=='default':
-                    ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
-                elif xlim is not None and xlim!='none':
-                    ax.set_xlim(xlim)
-                # xlim is None or 'none': leave autoscaled to the full data extent
-
-                if ylim_electrons=='default':
-                    if yscale=='log':
-                        ax.set_ylim(0.5, window_max_e * 1e4)
-                    elif yscale=='linear':
-                        ax.set_ylim(0, window_max_e + 2.5e4)
-                elif ylim_electrons!='none':
-                    ax.set_ylim(ylim_electrons)
-
-                if save_plots:
-                    output_path = fig_path / f'{base_name}_electrons_EXT{ext+1}.jpeg'
-                    plt.savefig(str(output_path), dpi=dpi)
-                    print(f'Saved plot to {output_path}')
-                _finish_fig(show_plots)
-
-    if plot_together:
-
-        if do_plot_adu:
-            fig, axs = plt.subplots(2, 2, figsize=subplots_figsize, constrained_layout=True, sharex=sharex, sharey=sharey)
+            fig, ax = plt.subplots(1, 1, figsize=individual_figsize, constrained_layout=True)
             if show_titles:
-                fig.suptitle(f'{additional_title}{suptitle} (Nimages = {nimages})')
-            axs = axs.flatten()
+                ax.set_title(rf'{additional_title}{suptitle} (Nimages = {nimages}): EXT {ext + 1}', fontsize=12, pad=10)
 
-            _ylims = []
-            for ext, data in enumerate(data_ext):
-                data = np.array(data).flatten()
-                zero_one_counts=zero_one_counts_ext[ext]
-                zero_one_edges=zero_one_edges_ext[ext]
-                pedestal=pedestals[ext]
-                gain=gains[ext]
-                double_gauss_popt=double_gauss_popts[ext]
-                zero_one_range=zero_one_ranges[ext]
+            if yscale=='log':
+                ax.set_yscale('log')
+            elif yscale!='linear':
+                ax.set_yscale(yscale)
 
-                ax = axs[ext]
+            ax.stairs(_bar_heights(zero_one_counts_e, yscale), zero_one_edges_e, fill=True)
+            ax.set_xlabel(r'Charge ($e^–$)')
+            ax.set_ylabel('N')
+            curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(zero_one_counts_e))
+            ax.plot(curve_x_e, double_gauss(curve_x_e, *double_gauss_popt_e), 'r',
+                label=r'$\sigma$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:3]
+                +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
+            ax.legend(loc="upper right", fontsize=fontsize)
 
+            if xlim=='default':
+                ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
+            elif xlim is not None and xlim!='none':
+                ax.set_xlim(xlim)
+            # xlim is None or 'none': leave autoscaled to the full data extent
+
+            if ylim_electrons=='default':
                 if yscale=='log':
-                    ax.set_yscale('log')
-                elif yscale!='linear':
-                    ax.set_yscale(yscale)
-
-                ax.stairs(_bar_heights(zero_one_counts, yscale), zero_one_edges, fill=True)
-
-                curve_x = _fit_curve_x(zero_one_range[0], zero_one_range[1], len(zero_one_counts))
-                fit_y = double_gauss(curve_x, *double_gauss_popt)
-                ax.plot(curve_x, fit_y, 'r',
-                    label=_zero_one_label_adu(double_gauss_popt, gain))
-
-                ax.set_xlabel('Charge (ADU)')
-                ax.set_ylabel('N')
-                ax.set_title(f'EXT {ext + 1}')
-                ax.legend(loc="upper right", fontsize=fontsize - 2)
-
-                if xlim=='default':
-                    ax.set_xlim(zero_one_range[0], zero_one_range[1])
-                elif xlim is not None and xlim!='none':
-                    ax.set_xlim(xlim)
-                # xlim is None or 'none': leave autoscaled to the full data extent
-
-                lim = _zero_one_ylim(ylim, yscale, zero_one_counts, fit_y)
-                _ylims.append(lim)
-                if not sharey and lim is not None:
-                    ax.set_ylim(lim)
-
-            # With sharey=True every subplot shares one range; span every extension by
-            # taking the minimum low and maximum high so no peak is clipped (the tallest
-            # peak need not be in the same extension as the lowest floor).
-            _valid = [lim for lim in _ylims if lim is not None]
-            if sharey and _valid:
-                axs[0].set_ylim(min(lo for lo, _ in _valid), max(hi for _, hi in _valid))
-
-            for i in (0, 1):
-                axs[i].set_xlabel('')
-                axs[i].tick_params(labelbottom=True)
-            for i in (1, 3):
-                axs[i].set_ylabel('')
-                axs[i].tick_params(labelleft=True)
+                    ax.set_ylim(0.5, window_max_e * 1e4)
+                elif yscale=='linear':
+                    ax.set_ylim(0, window_max_e + 2.5e4)
+            elif ylim_electrons!='none':
+                ax.set_ylim(ylim_electrons)
 
             if save_plots:
-                output_path = fig_path / f'{base_name}.jpeg'
+                output_path = fig_path / f'{base_name}_electrons_EXT{ext+1}.jpeg'
                 plt.savefig(str(output_path), dpi=dpi)
                 print(f'Saved plot to {output_path}')
             _finish_fig(show_plots)
 
-        if do_convert_to_electrons:
-            fig, axs = plt.subplots(2, 2, figsize=subplots_figsize, constrained_layout=True, sharex=sharex, sharey=sharey)
-            if show_titles:
-                fig.suptitle(rf'{additional_title}{suptitle} (Nimages = {nimages})')
-            axs = axs.flatten()
+    if plot_adu_together:
+        fig, axs = plt.subplots(2, 2, figsize=subplots_figsize, constrained_layout=True, sharex=sharex, sharey=sharey)
+        if show_titles:
+            fig.suptitle(f'{additional_title}{suptitle} (Nimages = {nimages})')
+        axs = axs.flatten()
 
-            _ylims = []
-            for ext, data in enumerate(data_ext):
-                ax = axs[ext]
+        _ylims = []
+        for ext, data in enumerate(data_ext):
+            data = np.array(data).flatten()
+            zero_one_counts=zero_one_counts_ext[ext]
+            zero_one_edges=zero_one_edges_ext[ext]
+            pedestal=pedestals[ext]
+            gain=gains[ext]
+            double_gauss_popt=double_gauss_popts[ext]
+            zero_one_range=zero_one_ranges[ext]
 
-                data = np.array(data).flatten()
-                zero_one_range = zero_one_ranges[ext]
-                pedestal = pedestals[ext]
-                gain = gains[ext]
+            ax = axs[ext]
 
-                # No one-electron peak -> gain undefined -> cannot convert to
-                # electrons; leave the subplot empty with a note and move on.
-                if np.isnan(gain):
-                    ax.set_title(f'EXT {ext + 1}')
-                    ax.set_xlabel(r'Charge ($e^–$)')
-                    ax.set_ylabel('N')
-                    ax.text(0.5, 0.5, r'no $1\,e^{–}$ peak found',
-                            ha='center', va='center', transform=ax.transAxes)
-                    _ylims.append(None)
-                    continue
+            if yscale=='log':
+                ax.set_yscale('log')
+            elif yscale!='linear':
+                ax.set_yscale(yscale)
 
-                data_window = data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
+            ax.stairs(_bar_heights(zero_one_counts, yscale), zero_one_edges, fill=True)
 
-                data_window_e = convert_to_electrons(data_window, pedestal, gain)
-                zero_one_range_e = convert_to_electrons(zero_one_range, pedestal, gain)
-                # Match the (scale-adjusted) ADU fit-window bin count so the electron
-                # plot keeps the same bins-to-window ratio when the window is widened.
-                nbins = len(zero_one_counts_ext[ext])
+            curve_x = _fit_curve_x(zero_one_range[0], zero_one_range[1], len(zero_one_counts))
+            fit_y = double_gauss(curve_x, *double_gauss_popt)
+            ax.plot(curve_x, fit_y, 'r',
+                label=_zero_one_label_adu(double_gauss_popt, gain))
 
-                # Window histogram (drawn as the bars).
-                zero_one_counts_e, zero_one_edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
-                zero_one_centers_e = 0.5 * (zero_one_edges_e[:-1] + zero_one_edges_e[1:])
+            ax.set_xlabel('Charge (ADU)')
+            ax.set_ylabel('N')
+            ax.set_title(f'EXT {ext + 1}')
+            ax.legend(loc="upper right", fontsize=fontsize - 2)
 
-                # Electron-unit curve: the ADU fit rescaled exactly, or a direct refit in
-                # electron units (see electron_fit_mode / _electron_double_gauss_popt).
-                double_gauss_popt_e = _electron_double_gauss_popt(
-                    double_gauss_popts[ext], pedestal, gain,
-                    zero_one_centers_e, zero_one_counts_e, electron_fit_mode)
+            if xlim=='default':
+                ax.set_xlim(zero_one_range[0], zero_one_range[1])
+            elif xlim is not None and xlim!='none':
+                ax.set_xlim(xlim)
+            # xlim is None or 'none': leave autoscaled to the full data extent
 
-                if yscale=='log':
-                    ax.set_yscale('log')
-                elif yscale!='linear':
-                    ax.set_yscale(yscale)
+            lim = _zero_one_ylim(ylim, yscale, zero_one_counts, fit_y)
+            _ylims.append(lim)
+            if not sharey and lim is not None:
+                ax.set_ylim(lim)
 
-                ax.stairs(_bar_heights(zero_one_counts_e, yscale), zero_one_edges_e, fill=True)
+        # With sharey=True every subplot shares one range; span every extension by
+        # taking the minimum low and maximum high so no peak is clipped (the tallest
+        # peak need not be in the same extension as the lowest floor).
+        _valid = [lim for lim in _ylims if lim is not None]
+        if sharey and _valid:
+            axs[0].set_ylim(min(lo for lo, _ in _valid), max(hi for _, hi in _valid))
 
+        for i in (0, 1):
+            axs[i].set_xlabel('')
+            axs[i].tick_params(labelbottom=True)
+        for i in (1, 3):
+            axs[i].set_ylabel('')
+            axs[i].tick_params(labelleft=True)
+
+        if save_plots:
+            output_path = fig_path / f'{base_name}.jpeg'
+            plt.savefig(str(output_path), dpi=dpi)
+            print(f'Saved plot to {output_path}')
+        _finish_fig(show_plots)
+
+    if plot_electrons_together:
+        fig, axs = plt.subplots(2, 2, figsize=subplots_figsize, constrained_layout=True, sharex=sharex, sharey=sharey)
+        if show_titles:
+            fig.suptitle(rf'{additional_title}{suptitle} (Nimages = {nimages})')
+        axs = axs.flatten()
+
+        _ylims = []
+        for ext, data in enumerate(data_ext):
+            ax = axs[ext]
+
+            data = np.array(data).flatten()
+            zero_one_range = zero_one_ranges[ext]
+            pedestal = pedestals[ext]
+            gain = gains[ext]
+
+            # No one-electron peak -> gain undefined -> cannot convert to
+            # electrons; leave the subplot empty with a note and move on.
+            if np.isnan(gain):
                 ax.set_title(f'EXT {ext + 1}')
-                curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(zero_one_counts_e))
-                fit_y_e = double_gauss(curve_x_e, *double_gauss_popt_e)
-                ax.plot(curve_x_e, fit_y_e, 'r',
-                    label=r'$\sigma$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:3]
-                    +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
-                ax.legend(loc="upper right", fontsize=fontsize - 2)
                 ax.set_xlabel(r'Charge ($e^–$)')
                 ax.set_ylabel('N')
+                ax.text(0.5, 0.5, r'no $1\,e^{–}$ peak found',
+                        ha='center', va='center', transform=ax.transAxes)
+                _ylims.append(None)
+                continue
 
-                if xlim=='default':
-                    ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
-                elif xlim is not None and xlim!='none':
-                    ax.set_xlim(xlim)
-                # xlim is None or 'none': leave autoscaled to the full data extent
+            data_window = data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
 
-                lim = _zero_one_ylim(ylim_electrons, yscale, zero_one_counts_e, fit_y_e)
-                _ylims.append(lim)
-                if not sharey and lim is not None:
-                    ax.set_ylim(lim)
+            data_window_e = convert_to_electrons(data_window, pedestal, gain)
+            zero_one_range_e = convert_to_electrons(zero_one_range, pedestal, gain)
+            # Match the (scale-adjusted) ADU fit-window bin count so the electron
+            # plot keeps the same bins-to-window ratio when the window is widened.
+            nbins = len(zero_one_counts_ext[ext])
 
-            _valid = [lim for lim in _ylims if lim is not None]
-            if sharey and _valid:
-                axs[0].set_ylim(min(lo for lo, _ in _valid), max(hi for _, hi in _valid))
+            # Window histogram (drawn as the bars).
+            zero_one_counts_e, zero_one_edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
+            zero_one_centers_e = 0.5 * (zero_one_edges_e[:-1] + zero_one_edges_e[1:])
 
-            for i in (0, 1):
-                axs[i].set_xlabel('')
-                axs[i].tick_params(labelbottom=True)
-            for i in (1, 3):
-                axs[i].set_ylabel('')
-                axs[i].tick_params(labelleft=True)
+            # Electron-unit curve: the ADU fit rescaled exactly, or a direct refit in
+            # electron units (see electron_fit_mode / _electron_double_gauss_popt).
+            double_gauss_popt_e = _electron_double_gauss_popt(
+                double_gauss_popts[ext], pedestal, gain,
+                zero_one_centers_e, zero_one_counts_e, electron_fit_mode)
 
-            if save_plots:
-                output_path = fig_path / f'{base_name}_electrons.jpeg'
-                plt.savefig(str(output_path), dpi=dpi)
-                print(f'Saved plot to {output_path}')
-            _finish_fig(show_plots)
+            if yscale=='log':
+                ax.set_yscale('log')
+            elif yscale!='linear':
+                ax.set_yscale(yscale)
+
+            ax.stairs(_bar_heights(zero_one_counts_e, yscale), zero_one_edges_e, fill=True)
+
+            ax.set_title(f'EXT {ext + 1}')
+            curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(zero_one_counts_e))
+            fit_y_e = double_gauss(curve_x_e, *double_gauss_popt_e)
+            ax.plot(curve_x_e, fit_y_e, 'r',
+                label=r'$\sigma$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:3]
+                +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
+            ax.legend(loc="upper right", fontsize=fontsize - 2)
+            ax.set_xlabel(r'Charge ($e^–$)')
+            ax.set_ylabel('N')
+
+            if xlim=='default':
+                ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
+            elif xlim is not None and xlim!='none':
+                ax.set_xlim(xlim)
+            # xlim is None or 'none': leave autoscaled to the full data extent
+
+            lim = _zero_one_ylim(ylim_electrons, yscale, zero_one_counts_e, fit_y_e)
+            _ylims.append(lim)
+            if not sharey and lim is not None:
+                ax.set_ylim(lim)
+
+        _valid = [lim for lim in _ylims if lim is not None]
+        if sharey and _valid:
+            axs[0].set_ylim(min(lo for lo, _ in _valid), max(hi for _, hi in _valid))
+
+        for i in (0, 1):
+            axs[i].set_xlabel('')
+            axs[i].tick_params(labelbottom=True)
+        for i in (1, 3):
+            axs[i].set_ylabel('')
+            axs[i].tick_params(labelleft=True)
+
+        if save_plots:
+            output_path = fig_path / f'{base_name}_electrons.jpeg'
+            plt.savefig(str(output_path), dpi=dpi)
+            print(f'Saved plot to {output_path}')
+        _finish_fig(show_plots)
 
 
 def _dark_current_fit_label(sigma_e, gain, N1):
@@ -472,115 +470,156 @@ def _dark_current_fit_label(sigma_e, gain, N1):
             + '\n' + r'gain = %.3f ADU/$e^-$, $N_1$ = %.4g' % (gain, N1))
 
 
+def _draw_dark_current_ax(ax, ext, data, zero_one_counts_ext, pedestals, gains,
+                          double_gauss_popts, zero_one_ranges, dark_current_rows,
+                          count_center, count_nsigma, electron_fit_mode, yscale,
+                          legend_fontsize):
+    """Draw one extension's dark-current window plot onto ``ax``.
+
+    Shared by both the combined 2x2 grid and the individual per-extension figures so
+    the two stay pixel-for-pixel identical aside from figure size/title.
+    """
+    ax.set_xlabel(r'Charge ($e^-$)')
+    ax.set_ylabel('N')
+
+    pedestal = pedestals[ext]
+    gain = gains[ext]
+    if np.isnan(gain):
+        ax.text(0.5, 0.5, r'no $1\,e^-$ peak found', ha='center', va='center',
+                transform=ax.transAxes)
+        return
+
+    data = np.asarray(data).flatten()
+    zero_one_range = zero_one_ranges[ext]
+    data_window = data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
+    data_window_e = convert_to_electrons(data_window, pedestal, gain)
+    zero_one_range_e = convert_to_electrons(np.asarray(zero_one_range), pedestal, gain,
+                                            flatten=False)
+    nbins = len(zero_one_counts_ext[ext])
+    counts_e, edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
+    centers_e = 0.5 * (edges_e[:-1] + edges_e[1:])
+
+    popt_e = _electron_double_gauss_popt(double_gauss_popts[ext], pedestal, gain,
+                                         centers_e, counts_e, electron_fit_mode)
+    sigma_e, N1 = popt_e[0], popt_e[4]
+
+    if yscale != 'linear':
+        ax.set_yscale(yscale)
+    ax.stairs(_bar_heights(counts_e, yscale), edges_e, fill=True, color='#4e117d')
+
+    curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(counts_e))
+    ax.plot(curve_x_e, double_gauss(curve_x_e, *popt_e), '#8dde1b',
+            label=_dark_current_fit_label(sigma_e, gain, N1))
+
+    # Each dark-current method actually present in dark_current_rows gets its own,
+    # independent legend entry -- these are not mutually exclusive.
+    dc_count = dark_current_rows[ext].get('dark_current_count_e_per_pix_day')
+    if dc_count is not None:
+        # 'count' method was used: draw its +/- count_nsigma * sigma window about the
+        # 1 e- charge, computed in ADU exactly as the method does, then converted to
+        # electrons so the lines match the pixels actually counted (independent of
+        # any refit). Label it with the method's dark current.
+        popt = double_gauss_popts[ext]
+        sigma_adu = popt[0]
+        center_adu = popt[2] if count_center == 'mu1' else pedestal + gain
+        lo_e = (center_adu - count_nsigma * sigma_adu - pedestal) / gain
+        hi_e = (center_adu + count_nsigma * sigma_adu - pedestal) / gain
+        window_label = (rf'count (window $\pm${count_nsigma:g}$\,\sigma$)'
+                        + '\n' + r'dark current = %.3g $e^-$/pix/day' % dc_count)
+        ax.axvline(lo_e, color='k', linestyle=':', linewidth=1.2, label=window_label)
+        ax.axvline(hi_e, color='k', linestyle=':', linewidth=1.2)
+
+    dc_integrate = dark_current_rows[ext].get('dark_current_integrate_e_per_pix_day')
+    if dc_integrate is not None:
+        # 'integrate' method was used: shade the area under the fitted one-electron
+        # Gaussian component (reusing popt_e/curve_x_e from the fit curve above, so
+        # the shading matches it exactly) and label it with the method's dark current.
+        one_e_curve = popt_e[4] * np.exp(-(curve_x_e - popt_e[2])**2 / (2 * popt_e[0]**2))
+        integrate_label = (r'integrate (1$e^-$ Gaussian)'
+                           + '\n' + r'dark current = %.3g $e^-$/pix/day' % dc_integrate)
+        ax.fill_between(curve_x_e, one_e_curve, color='#ff7f0e', alpha=0.4,
+                        label=integrate_label)
+
+    dc_weighted = dark_current_rows[ext].get('dark_current_weighted_e_per_pix_day')
+    if dc_weighted is not None:
+        # 'weighted' method was used: report its dark current and formula as a
+        # legend-only entry (no corresponding visual element).
+        ax.plot([], [], ' ',
+                label=(r'weighted (SER = $N_1$ / $(N_1 + N_0)$)' \
+                       + '\n' + 'dark current = %.3g $e^-$/pix/day' % dc_weighted))
+
+    ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
+    ax.legend(loc='upper right', fontsize=legend_fontsize)
+
+
 def plot_dark_current_zero_one(data_ext, zero_one_counts_ext, zero_one_edges_ext,
                                pedestals, gains, double_gauss_popts, zero_one_ranges,
                                dark_current_rows, count_center='one_electron',
                                count_nsigma=1.0, electron_fit_mode='transform',
-                               nimages=10, figsize=_SUBPLOTS_FIGSIZE, fontsize=10, yscale='log',
+                               nimages=10, subplots_figsize=_SUBPLOTS_FIGSIZE,
+                               individual_figsize=_INDIVIDUAL_FIGSIZE,
+                               fontsize=10, yscale='log',
                                suptitle='Dark-Current Window (Zero-One Peaks, electrons)',
                                additional_title='', show_titles=True,
+                               plot_individual=False, plot_together=True,
                                save_plots=False, show_plots=True,
                                fig_path='./', file='dark_current', dpi=350):
     """Plot the electron-unit zero/one distributions with the dark-current count window.
 
-    One subplot per extension (2x2): the electron-unit histogram and fitted
-    double-Gaussian curve, with one independent legend entry per dark-current method
-    actually present in ``dark_current_rows`` for that extension (the shared-sigma/
-    gain/N1 fit-curve entry is always shown in addition). When the 'count' method was
-    used, vertical dashed lines mark the +/- ``count_nsigma`` * sigma charge window it
-    integrates around 1 e-. When the 'integrate' method was used, the area under the
-    fitted one-electron Gaussian component is shaded. When the 'weighted' method was
-    used, its dark current and formula are reported as a legend-only entry. Any
-    combination of these may appear together (up to 4 legend entries total).
-    Extensions with no one-electron peak (gain undefined) cannot be converted to
-    electrons and are left with an explanatory note.
+    The electron-unit histogram and fitted double-Gaussian curve, with one independent
+    legend entry per dark-current method actually present in ``dark_current_rows`` for
+    that extension (the shared-sigma/gain/N1 fit-curve entry is always shown in
+    addition). When the 'count' method was used, vertical dashed lines mark the +/-
+    ``count_nsigma`` * sigma charge window it integrates around 1 e-. When the
+    'integrate' method was used, the area under the fitted one-electron Gaussian
+    component is shaded. When the 'weighted' method was used, its dark current and
+    formula are reported as a legend-only entry. Any combination of these may appear
+    together (up to 4 legend entries total). Extensions with no one-electron peak (gain
+    undefined) cannot be converted to electrons and are left with an explanatory note.
+
+    ``plot_together`` (default True) draws one combined 2x2 grid; ``plot_individual``
+    (default False) additionally draws one standalone figure per extension. Both may be
+    enabled at once.
     """
     fig_path = Path(fig_path)
     base_name = Path(file).stem + '_dark_current' if file != 'dark_current' else file
 
-    fig, axs = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
-    if show_titles:
-        fig.suptitle(f'{additional_title}{suptitle} (Nimages = {nimages})')
-    axs = axs.flatten()
+    if plot_individual:
+        for ext, data in enumerate(data_ext):
+            fig, ax = plt.subplots(1, 1, figsize=individual_figsize, constrained_layout=True)
+            if show_titles:
+                ax.set_title(f'{additional_title}{suptitle} (Nimages = {nimages}): EXT {ext + 1}',
+                            fontsize=12, pad=10)
 
-    for ext, data in enumerate(data_ext):
-        ax = axs[ext]
-        ax.set_title(f'EXT {ext + 1}')
-        ax.set_xlabel(r'Charge ($e^-$)')
-        ax.set_ylabel('N')
+            _draw_dark_current_ax(ax, ext, data, zero_one_counts_ext, pedestals, gains,
+                                  double_gauss_popts, zero_one_ranges, dark_current_rows,
+                                  count_center, count_nsigma, electron_fit_mode, yscale,
+                                  legend_fontsize=fontsize)
 
-        pedestal = pedestals[ext]
-        gain = gains[ext]
-        if np.isnan(gain):
-            ax.text(0.5, 0.5, r'no $1\,e^-$ peak found', ha='center', va='center',
-                    transform=ax.transAxes)
-            continue
+            if save_plots:
+                output_path = fig_path / f'{base_name}_EXT{ext+1}.jpeg'
+                plt.savefig(str(output_path), dpi=dpi)
+                print(f'Saved plot to {output_path}')
+            _finish_fig(show_plots)
 
-        data = np.asarray(data).flatten()
-        zero_one_range = zero_one_ranges[ext]
-        data_window = data[(data > zero_one_range[0]) & (data < zero_one_range[1])]
-        data_window_e = convert_to_electrons(data_window, pedestal, gain)
-        zero_one_range_e = convert_to_electrons(np.asarray(zero_one_range), pedestal, gain,
-                                                flatten=False)
-        nbins = len(zero_one_counts_ext[ext])
-        counts_e, edges_e = np.histogram(data_window_e, bins=nbins, range=zero_one_range_e)
-        centers_e = 0.5 * (edges_e[:-1] + edges_e[1:])
+    if plot_together:
+        fig, axs = plt.subplots(2, 2, figsize=subplots_figsize, constrained_layout=True)
+        if show_titles:
+            fig.suptitle(f'{additional_title}{suptitle} (Nimages = {nimages})')
+        axs = axs.flatten()
 
-        popt_e = _electron_double_gauss_popt(double_gauss_popts[ext], pedestal, gain,
-                                             centers_e, counts_e, electron_fit_mode)
-        sigma_e, N1 = popt_e[0], popt_e[4]
+        for ext, data in enumerate(data_ext):
+            ax = axs[ext]
+            ax.set_title(f'EXT {ext + 1}')
 
-        if yscale != 'linear':
-            ax.set_yscale(yscale)
-        ax.stairs(_bar_heights(counts_e, yscale), edges_e, fill=True, color='#4e117d')
+            _draw_dark_current_ax(ax, ext, data, zero_one_counts_ext, pedestals, gains,
+                                  double_gauss_popts, zero_one_ranges, dark_current_rows,
+                                  count_center, count_nsigma, electron_fit_mode, yscale,
+                                  legend_fontsize=fontsize - 2)
 
-        curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(counts_e))
-        ax.plot(curve_x_e, double_gauss(curve_x_e, *popt_e), '#8dde1b',
-                label=_dark_current_fit_label(sigma_e, gain, N1))
-
-        # Each dark-current method actually present in dark_current_rows gets its own,
-        # independent legend entry -- these are not mutually exclusive.
-        dc_count = dark_current_rows[ext].get('dark_current_count_e_per_pix_day')
-        if dc_count is not None:
-            # 'count' method was used: draw its +/- count_nsigma * sigma window about the
-            # 1 e- charge, computed in ADU exactly as the method does, then converted to
-            # electrons so the lines match the pixels actually counted (independent of
-            # any refit). Label it with the method's dark current.
-            popt = double_gauss_popts[ext]
-            sigma_adu = popt[0]
-            center_adu = popt[2] if count_center == 'mu1' else pedestal + gain
-            lo_e = (center_adu - count_nsigma * sigma_adu - pedestal) / gain
-            hi_e = (center_adu + count_nsigma * sigma_adu - pedestal) / gain
-            window_label = (rf'count (window $\pm${count_nsigma:g}$\,\sigma$)'
-                            + '\n' + r'dark current = %.3g $e^-$/pix/day' % dc_count)
-            ax.axvline(lo_e, color='k', linestyle=':', linewidth=1.2, label=window_label)
-            ax.axvline(hi_e, color='k', linestyle=':', linewidth=1.2)
-
-        dc_integrate = dark_current_rows[ext].get('dark_current_integrate_e_per_pix_day')
-        if dc_integrate is not None:
-            # 'integrate' method was used: shade the area under the fitted one-electron
-            # Gaussian component (reusing popt_e/curve_x_e from the fit curve above, so
-            # the shading matches it exactly) and label it with the method's dark current.
-            one_e_curve = popt_e[4] * np.exp(-(curve_x_e - popt_e[2])**2 / (2 * popt_e[0]**2))
-            integrate_label = (r'integrate (1$e^-$ Gaussian)'
-                               + '\n' + r'dark current = %.3g $e^-$/pix/day' % dc_integrate)
-            ax.fill_between(curve_x_e, one_e_curve, color='#ff7f0e', alpha=0.4,
-                            label=integrate_label)
-
-        dc_weighted = dark_current_rows[ext].get('dark_current_weighted_e_per_pix_day')
-        if dc_weighted is not None:
-            # 'weighted' method was used: report its dark current and formula as a
-            # legend-only entry (no corresponding visual element).
-            ax.plot([], [], ' ',
-                    label=(r'weighted (SER = $N_1$ / $(N_1 + N_0)$)' \
-                           + '\n' + 'dark current = %.3g $e^-$/pix/day' % dc_weighted))
-
-        ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
-        ax.legend(loc='upper right', fontsize=fontsize - 2)
-
-    if save_plots:
-        output_path = fig_path / f'{base_name}.jpeg'
-        plt.savefig(str(output_path), dpi=dpi)
-        print(f'Saved plot to {output_path}')
-    _finish_fig(show_plots)
+        if save_plots:
+            output_path = fig_path / f'{base_name}.jpeg'
+            plt.savefig(str(output_path), dpi=dpi)
+            print(f'Saved plot to {output_path}')
+        _finish_fig(show_plots)
 
