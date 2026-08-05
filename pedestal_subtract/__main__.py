@@ -207,24 +207,40 @@ def init_argparse(argv=None):
                              "extension). Omit to auto-detect for all. Values must be > 0.")
 
     # ----- Plotting -----
-    parser.add_argument("-z", "--plot_zero_one_adu", action="store_true",
-                        default=_config_default(config, 'plot_zero_one_adu', True),
-                        help="Plot the double-Gaussian fits in ADU.")
-    parser.add_argument("--no-plot_zero_one_adu", dest="plot_zero_one_adu", action="store_false",
-                        help="Disable the ADU-units plot.")
-    parser.add_argument("--plot_zero_one_electrons", action="store_true",
-                        default=_config_default(config, 'plot_zero_one_electrons', True),
-                        help="Also produce the electron-units version of the fits.")
-    parser.add_argument("--no-plot_zero_one_electrons", dest="plot_zero_one_electrons",
-                        action="store_false", help="Disable the electron-units plot.")
-    parser.add_argument("--plot_dark_current", action="store_true",
-                        default=_config_default(config, 'plot_dark_current', True),
+    parser.add_argument("--plot_zero_one_ADU_individual", action="store_true",
+                        default=_config_default(config, 'plot_zero_one_ADU_individual', False),
+                        help="Plot the double-Gaussian fits in ADU, one figure per extension.")
+    parser.add_argument("--no-plot_zero_one_ADU_individual", dest="plot_zero_one_ADU_individual",
+                        action="store_false", help="Disable the individual-per-extension ADU-units plots.")
+    parser.add_argument("--plot_zero_one_ADU_together", action="store_true",
+                        default=_config_default(config, 'plot_zero_one_ADU_together', True),
+                        help="Plot the double-Gaussian fits in ADU, as a combined 2x2 subplot.")
+    parser.add_argument("--no-plot_zero_one_ADU_together", dest="plot_zero_one_ADU_together",
+                        action="store_false", help="Disable the combined ADU-units plot.")
+    parser.add_argument("--plot_zero_one_electrons_individual", action="store_true",
+                        default=_config_default(config, 'plot_zero_one_electrons_individual', False),
+                        help="Plot the double-Gaussian fits in electron units, one figure per extension.")
+    parser.add_argument("--no-plot_zero_one_electrons_individual", dest="plot_zero_one_electrons_individual",
+                        action="store_false", help="Disable the individual-per-extension electron-units plots.")
+    parser.add_argument("--plot_zero_one_electrons_together", action="store_true",
+                        default=_config_default(config, 'plot_zero_one_electrons_together', True),
+                        help="Plot the double-Gaussian fits in electron units, as a combined 2x2 subplot.")
+    parser.add_argument("--no-plot_zero_one_electrons_together", dest="plot_zero_one_electrons_together",
+                        action="store_false", help="Disable the combined electron-units plot.")
+    parser.add_argument("--plot_dark_current_together", action="store_true",
+                        default=_config_default(config, 'plot_dark_current_together', True),
                         help="Plot the electron-unit zero/one distributions with the "
                              "dark-current count window marked (vertical lines, when the "
                              "'count' method is used) and a legend of the shared sigma, "
-                             "gain and dark current.")
-    parser.add_argument("--no-plot_dark_current", dest="plot_dark_current",
-                        action="store_false", help="Disable the dark-current window plot.")
+                             "gain and dark current, as a combined 2x2 grid.")
+    parser.add_argument("--no-plot_dark_current_together", dest="plot_dark_current_together",
+                        action="store_false", help="Disable the combined dark-current window plot.")
+    parser.add_argument("--plot_dark_current_individual", action="store_true",
+                        default=_config_default(config, 'plot_dark_current_individual', False),
+                        help="Same as --plot_dark_current_together, but draws one figure "
+                             "per extension instead of a combined 2x2 grid.")
+    parser.add_argument("--no-plot_dark_current_individual", dest="plot_dark_current_individual",
+                        action="store_false", help="Disable the individual dark-current window plots.")
     parser.add_argument("--plot_charge_per_column_together", action="store_true",
                         default=_config_default(config, 'plot_charge_per_column_together', False),
                         help="Plot the median charge per column for each extension on the raw "
@@ -250,16 +266,6 @@ def init_argparse(argv=None):
     # Display-only options below default to None when unset (no CLI flag, not in config)
     # so plot_zero_one_peaks's signature defaults stay the single source of truth; main()
     # forwards only the ones that were actually set.
-    parser.add_argument("--plot_zero_one_individual", action="store_true",
-                        default=_config_default(config, 'plot_zero_one_individual', None),
-                        help="Plot one figure per extension.")
-    parser.add_argument("--no-plot_zero_one_individual", dest="plot_zero_one_individual",
-                        action="store_false", help="Disable individual per-extension figures.")
-    parser.add_argument("--plot_zero_one_together", action="store_true",
-                        default=_config_default(config, 'plot_zero_one_together', None),
-                        help="Plot all extensions in a combined 2x2 subplot.")
-    parser.add_argument("--no-plot_zero_one_together", dest="plot_zero_one_together",
-                        action="store_false", help="Disable the combined 2x2 subplot.")
     parser.add_argument("--plot_zero_one_yscale", type=str,
                         default=_config_default(config, 'plot_zero_one_yscale', None),
                         help="Y-axis scale: 'linear' or 'log'.")
@@ -289,8 +295,13 @@ def init_argparse(argv=None):
     parser.add_argument("--plot_dark_current_figsize", nargs=2, type=float,
                         default=_config_default(config, 'plot_dark_current_figsize', None),
                         metavar=('W', 'H'),
-                        help=f"Figure size for the dark-current window plot. "
+                        help=f"Figure size for the combined dark-current window plot. "
                              f"Default: the shared subplots size {_SUBPLOTS_FIGSIZE}.")
+    parser.add_argument("--plot_dark_current_individual_figsize", nargs=2, type=float,
+                        default=_config_default(config, 'plot_dark_current_individual_figsize', None),
+                        metavar=('W', 'H'),
+                        help=f"Figure size for the individual dark-current window plots. "
+                             f"Default: the shared individual size {_INDIVIDUAL_FIGSIZE}.")
     parser.add_argument("--plot_charge_per_column_figsize", nargs=2, type=float,
                         default=_config_default(config, 'plot_charge_per_column_figsize', None),
                         metavar=('W', 'H'),
@@ -773,7 +784,24 @@ def main(argv=None):
                                     raw_pedestals=raw_pedestals)
         print(f'Saved per-extension summary to {summary_csv_path}\n')
 
-    if args.plot_zero_one_adu or args.plot_zero_one_electrons:
+        # If a meta_studies run is active (see scripts/set_meta_run.py), append
+        # this extension_summary.csv to it as a dataset. Guarded so a problem
+        # here can never break the analysis run.
+        try:
+            from . import meta_run
+            result = meta_run.append_dataset(summary_csv_path)
+            active = meta_run.active_run()
+            if result == meta_run.APPENDED:
+                print(f"Added this run to meta study "
+                      f"'{active['run_name']}' ({active['path']})\n")
+            elif result == meta_run.DUPLICATE:
+                print(f"This run is already in meta study "
+                      f"'{active['run_name']}'; not added again.\n")
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f'Warning: could not update meta study run ({exc}).\n')
+
+    if (args.plot_zero_one_ADU_individual or args.plot_zero_one_ADU_together
+            or args.plot_zero_one_electrons_individual or args.plot_zero_one_electrons_together):
         # Forward only the display options the user/config actually set (non-None); the rest
         # fall through to plot_zero_one_peaks's signature defaults, the single source of truth.
         plot_overrides = {
@@ -800,8 +828,6 @@ def main(argv=None):
             suptitle='Double-Gaussian Fit to Zero-One Electron Peaks',
             nimages=nimages,
             fontsize=12,
-            do_plot_adu=args.plot_zero_one_adu,
-            do_convert_to_electrons=args.plot_zero_one_electrons,
             save_plots=args.save_output,
             show_plots=args.show_plots,
             fig_path=str(fig_path),
@@ -809,7 +835,7 @@ def main(argv=None):
             dpi=350,
         )
 
-    if args.plot_dark_current and dark_current_rows is not None:
+    if (args.plot_dark_current_together or args.plot_dark_current_individual) and dark_current_rows is not None:
         plot_dark_current_zero_one(
             data_ext,
             zero_one_counts_ext,
@@ -823,8 +849,12 @@ def main(argv=None):
             count_nsigma=args.dark_current_count_nsigma,
             electron_fit_mode=args.electron_fit_mode or 'transform',
             nimages=nimages,
-            figsize=(tuple(args.plot_dark_current_figsize)
+            subplots_figsize=(tuple(args.plot_dark_current_figsize)
                      if args.plot_dark_current_figsize is not None else _SUBPLOTS_FIGSIZE),
+            individual_figsize=(tuple(args.plot_dark_current_individual_figsize)
+                     if args.plot_dark_current_individual_figsize is not None else _INDIVIDUAL_FIGSIZE),
+            plot_together=args.plot_dark_current_together,
+            plot_individual=args.plot_dark_current_individual,
             yscale=args.plot_zero_one_yscale or 'log',
             additional_title=args.extra_plot_title if args.extra_plot_title else '',
             show_titles=args.show_titles if args.show_titles is not None else True,

@@ -5,3 +5,6 @@ build/
 dist/
 *.pedsub.fits
 .DS_Store
+
+# Active meta_studies run pointer (see scripts/set_meta_run.py)
+.meta_run_state.json

@@ -69,7 +69,7 @@ Save plots without displaying them, and also produce the electron version:
 
 ```bash
 python -m pedestal_subtract path/to/image.fits \
-    --save_output --no-show_plots --plot_zero_one_electrons -o ./plots
+    --save_output --no-show_plots --plot_zero_one_electrons_together -o ./plots
 ```
 
 If you want to configure the parameters yourself, you can use a JSON config (CLI flags override config values):
@@ -100,9 +100,12 @@ python -m pedestal_subtract --help
 | `--zero_one_gain_guess GAIN ...` | auto-detect | Seed for the one-electron peak location — a guess for the gain (ADU/e⁻). The seed places `μ₁` at `μ₀ + gain` and **restricts the fit bound on `μ₁` to a tight ±0.05 ADU band** around that location, so the fit stays on the guessed peak instead of sliding down onto the zero-peak tail. It does **not** affect the fit window size or the binning (those come from the auto-detected bump and `--zero_one_n_bins`). The post-fit acceptance band (gain ∈ [0.5, 1.8] ADU/e⁻) is unchanged. Pass one value to apply it to **every** extension, or one **per** extension (e.g. 4 values for 4 extensions). In the JSON config use a single number or a per-extension list of numbers/`null` (e.g. `[1.05, null, 0.95, 1.1]`, where `null` auto-detects that extension). Values must be > 0. Omit to auto-detect for all. |
 | `--force_pedsub` | off | Recompute, ignoring the on-disk cache. |
 | `--pedsub_cache_dir DIR` | `cache/` beside source | Where to write the `*.pedsub.fits` cache. |
-| `-z` / `--plot_zero_one_adu` | on | Plot fits in ADU. |
-| `--plot_zero_one_electrons` | off | Also plot in electron units. |
-| `--plot_dark_current` | on | Plot the electron-unit zero/one distributions with a legend of σ, gain and the dark current(s). When the `count` method is used, the count window is marked by vertical dashed lines (±`dark_current_count_nsigma`·σ about 1 e⁻); when it is not, those lines are omitted and (if the `weighted` method is used) the legend instead reports the weighted dark current and its formula `n_events = N₁/(N₁+N₀)`. |
+| `--plot_zero_one_ADU_individual` | off | Plot the fits in ADU, one figure per extension. |
+| `--plot_zero_one_ADU_together` | on | Plot the fits in ADU, as a combined 2×2 grid. |
+| `--plot_zero_one_electrons_individual` | off | Plot the fits in electron units, one figure per extension. |
+| `--plot_zero_one_electrons_together` | on | Plot the fits in electron units, as a combined 2×2 grid. |
+| `--plot_dark_current_together` | on | Plot the electron-unit zero/one distributions with a legend of σ, gain and the dark current(s), as a combined 2×2 grid. When the `count` method is used, the count window is marked by vertical dashed lines (±`dark_current_count_nsigma`·σ about 1 e⁻); when it is not, those lines are omitted and (if the `weighted` method is used) the legend instead reports the weighted dark current and its formula `n_events = N₁/(N₁+N₀)`. |
+| `--plot_dark_current_individual` | off | Same as `--plot_dark_current_together`, but draws one figure per extension instead of a combined 2×2 grid. |
 | `--plot_charge_per_column_together` | off | Plot the median charge per column for each extension (2×2 grid) on the **raw**, pre-pedestal-subtraction data — a diagnostic for anomalous columns. A column whose median sits ≥ `--n_std_to_mask` biweight-SDs from the extension's biweight location is flagged "hot" (drawn red). Every column is plotted; the columns **excluded** by `--fit_cols` are shaded light grey so the masked-out region is visible (with `--fit_cols auto`, the shaded columns are exactly the red hot ones). With `--verbose`, the hot columns per extension are also printed. |
 | `--plot_charge_per_column_individual` | off | Same as `--plot_charge_per_column_together`, but draws one figure per extension instead of a combined 2×2 grid. |
 | `--electron_fit_mode` | `transform` | How the electron-unit curve is obtained. `transform` analytically rescales the converged ADU fit (exact; μ₀ = 0 / μ₁ = 1 by construction, no refit). `refit` fits the double Gaussian again directly to the electron-unit histogram, letting the peaks/widths re-optimise in electron space (widths kept positive, amplitudes non-negative, means free; falls back to the transform if the refit fails). Only affects the electron-units plot. |
@@ -202,10 +205,13 @@ as in `nonlinearity_studies`. The keys this package consumes:
 `zero_one_n_bins`, `zero_one_window_left_scale`, `zero_one_window_right_scale`,
 `zero_one_gain_guess`, `fit_cols`,
 `pedsub_cache_dir`, `force_pedsub`, `use_biweight_loc`, `use_biweight_midvar`,
-`plot_zero_one_adu`, `plot_zero_one_electrons`, `plot_dark_current`,
-`plot_charge_per_column_together`, `plot_charge_per_column_individual`, `electron_fit_mode`, `plot_zero_one_individual`,
-`plot_zero_one_together`, `plot_zero_one_yscale`, `plot_zero_one_individual_figsize`,
-`plot_zero_one_subplots_figsize`, `plot_dark_current_figsize`, `plot_charge_per_column_figsize`,
+`plot_zero_one_ADU_individual`, `plot_zero_one_ADU_together`,
+`plot_zero_one_electrons_individual`, `plot_zero_one_electrons_together`,
+`plot_dark_current_together`, `plot_dark_current_individual`,
+`plot_charge_per_column_together`, `plot_charge_per_column_individual`, `electron_fit_mode`,
+`plot_zero_one_yscale`, `plot_zero_one_individual_figsize`,
+`plot_zero_one_subplots_figsize`, `plot_dark_current_figsize`, `plot_dark_current_individual_figsize`,
+`plot_charge_per_column_figsize`,
 `plot_charge_per_column_individual_figsize`,
 `plot_zero_one_sharex`, `plot_zero_one_sharey`,
 `extra_plot_title`, `nimages`, `show_titles`, `save_output`,
