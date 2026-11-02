@@ -82,6 +82,42 @@ def _estimate_peak_width(centers, counts, peak_index):
     return max((centers[right_index] - centers[left_index]) / 2.355, bin_width)
 
 
+def _estimate_one_peak_amplitude(zero_one_centers, zero_one_counts, mu0, sigma, N0, n_sigma=5.0):
+    """Seed/bound the one-electron amplitude N_1 from the tallest *background-
+    subtracted* fit-histogram bin at least ``n_sigma`` sigma to the right of ``mu0``.
+
+    Even ``n_sigma`` out, the zero-electron Gaussian's own tail is often still taller
+    than a genuine one-electron bump (especially at low one-electron occupancy, or
+    when the gain isn't much bigger than ``n_sigma`` sigma) -- so subtract the
+    zero-electron Gaussian's estimated count at each bin (amplitude ``N0``, mean
+    ``mu0``, width ``sigma``) before taking the max. Without this, the raw max in that
+    region tends to land right at the near edge of the search window, still on the
+    zero peak's shoulder, which both overstates N_1 and -- because the fit then has to
+    justify that amplitude somewhere -- can drag the fitted mu_1 (and therefore the
+    gain) down onto that shoulder too. Returns (one_peak_count, n1_low, n1_high).
+
+    Callers should pass the best available (mu0, sigma, N0) -- the stage-1-fitted
+    zero-electron mean/width/amplitude once a fit exists, since the pre-fit heuristic
+    estimates can sit close enough to the true peak that the region still overlaps
+    its tail.
+    """
+    one_e_region = zero_one_centers > (mu0 + n_sigma * sigma)
+    zero_est = N0 * np.exp(-(zero_one_centers - mu0) ** 2 / (2 * sigma ** 2))
+    excess = zero_one_counts - zero_est
+    one_peak_count = max(float(np.max(excess[one_e_region])), 0.0) if one_e_region.any() else 0.0
+    # NOTE: with _MIN_GAIN_ADU=0.5 and sigma ~0.2 ADU, 5*sigma (~1.0) can sit above
+    # the minimum allowed gain -- for a genuinely low-gain peak (< ~5 sigma from the
+    # pedestal) one_e_region may end up empty, or may miss the real bump and fall
+    # back to background noise, giving one_peak_count ~= 0.
+    # Asymmetric Poisson band: the sqrt(counts) weighting systematically biases a
+    # sparse peak's amplitude LOW (undershooting the bump top costs less than
+    # overshooting the empty flank bins), so hold N_1 within 1 sigma below the
+    # measured height but allow 2 sigma above.
+    n1_low = max(0.0, one_peak_count - 0.5 * np.sqrt(one_peak_count))
+    n1_high = one_peak_count + 2.0 * np.sqrt(one_peak_count + 1.0)
+    return one_peak_count, n1_low, n1_high
+
+
 def _clip_to_bounds(values, bounds):
     low, high = [np.array(bound, dtype=float) for bound in bounds]
     values = np.array(values, dtype=float)
@@ -284,10 +320,13 @@ def _auto_zero_one_setup(data, zero_one_test_range, n_bins=_ZERO_ONE_N_BINS,
         # zero-peak width below the detected bump: on a wide zero peak (4 widths >
         # the real gain) an uncapped guard would exclude the genuine peak from the
         # fit entirely, leaving curve_fit to park mu_1 on the far tail and fail the
-        # acceptance band. Acceptance is restricted to [_MIN_GAIN_ADU, _MAX_GAIN_ADU]
+        # acceptance band. It is also capped at the minimum gain (one_lo): otherwise a
+        # real one-electron peak between _MIN_GAIN_ADU and ~4 widths is excluded and
+        # the fit parks on its upper flank (e.g. a 0.55 ADU first-electron peak read
+        # as 0.77). Acceptance is restricted to [_MIN_GAIN_ADU, _MAX_GAIN_ADU]
         # after the fit (in calculate_noise_gain).
         shoulder_guard = min(zero_peak_charge + 4 * zero_peak_width,
-                             one_peak_charge - zero_peak_width)
+                             one_peak_charge - zero_peak_width, one_lo)
         m1_low = max(one_lo - _GAIN_FIT_MARGIN, shoulder_guard)
         m1_high = min(fit_right, one_hi + _GAIN_FIT_MARGIN)
         if m1_high <= m1_low:
@@ -305,25 +344,13 @@ def _auto_zero_one_setup(data, zero_one_test_range, n_bins=_ZERO_ONE_N_BINS,
     # that otherwise yields a confident but bogus gain). popt layout is
     # (s, m0, m1, N0, N1): both peaks share the single width ``s``.
     sigma_floor = max(0.3 * zero_peak_width, (zero_one_centers[1] - zero_one_centers[0]) / 10, 1e-8)
-    # Tie the one-electron amplitude to the data: N_1 is the fitted Gaussian's height
-    # at mu_1, so it must match the observed height of the one-electron bump -- the
-    # largest fit-histogram count in the allowed mu_1 band, after subtracting the zero
-    # Gaussian's estimated contribution to each bin (with coarse bins, the raw count
-    # of a bin near the band's lower edge is mostly zero-peak tail, which would force
-    # a phantom N_1 and drag mu_1 down onto the shoulder to justify it). Bounding N_1
-    # to that height +/- ~2*sqrt(height) (Poisson) stops the fit from deflating N_1
-    # toward zero while the zero Gaussian stretches to absorb the bump; an empty band
-    # leaves the lower bound at 0, so "no peak" stays reachable.
-    band = (zero_one_centers >= m1_low) & (zero_one_centers <= m1_high)
-    zero_est = max_zero_one_counts * np.exp(
-        -(zero_one_centers - zero_peak_charge) ** 2 / (2 * zero_peak_width ** 2))
-    one_peak_count = max(float(np.max((zero_one_counts - zero_est)[band])), 0.0) if band.any() else 0.0
-    # Asymmetric Poisson band: the sqrt(counts) weighting systematically biases a
-    # sparse peak's amplitude LOW (undershooting the bump top costs less than
-    # overshooting the empty flank bins), so hold N_1 within 1 sigma below the
-    # measured height but allow 2 sigma above.
-    n1_low = max(0.0, one_peak_count - 0.5*np.sqrt(one_peak_count))
-    n1_high = one_peak_count + 2.0 * np.sqrt(one_peak_count + 1.0)
+    # Tie the one-electron amplitude to the data, independent of mu_1's fit window (and
+    # therefore independent of whether a gain_seed was supplied): see
+    # _estimate_one_peak_amplitude. This is a pre-fit seed only -- calculate_noise_gain
+    # recomputes N_1's bounds from the stage-1-fitted mu_0/sigma before the (bounded)
+    # stage-2 fit, which is what actually constrains N_1.
+    one_peak_count, n1_low, n1_high = _estimate_one_peak_amplitude(
+        zero_one_centers, zero_one_counts, zero_peak_charge, zero_peak_width, max_zero_one_counts)
     fit_bounds_low = [
         sigma_floor,
         max(fit_left, zero_peak_charge - m0_margin),

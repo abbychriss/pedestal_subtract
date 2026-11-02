@@ -4,7 +4,9 @@ dark_current — split out of core.py.
 import numpy as np
 from scipy.special import erf
 
-from .constants import _DARK_CURRENT_COLUMN, _DARK_CURRENT_METHODS
+from .constants import (_DARK_CURRENT_BINNED_COLUMN, _DARK_CURRENT_BINNED_IMAGE_COLUMN,
+                        _DARK_CURRENT_COLUMN, _DARK_CURRENT_IMAGE_COLUMN,
+                        _DARK_CURRENT_METHODS)
 
 def _resolve_dark_current_methods(method):
     """Methods to compute, from a 'count'/'integrate'/'weighted'/'all' selector, or a
@@ -112,11 +114,26 @@ def _single_electron_count_weighted(double_gauss_popt, gain):
 def calculate_dark_current(data_ext, pedestals, gains, double_gauss_popts,
                            zero_one_edges_ext, exposure_days, method='all',
                            count_center='one_electron', count_nsigma=1.0,
-                           pixel_binning=1):
-    """Per-extension dark current (electrons / physical pixel / day) by one or more methods.
+                           pixel_binning=1, per_day=True):
+    """Per-extension dark current by one or more methods, per image and (optionally) per day.
 
-    Dark current = (number of single-electron events) / (number of physical pixels) /
-    (exposure time in days). The single-electron events are counted by:
+    Dark current = (number of single-electron events) / (number of physical pixels),
+    optionally / (exposure time in days). Both normalisations are reported:
+
+    - electrons / physical pixel / *image* (``_DARK_CURRENT_IMAGE_COLUMN``), always;
+    - electrons / physical pixel / *day* (``_DARK_CURRENT_COLUMN``), i.e. the per-image
+      rate divided by ``exposure_days``, only when ``per_day`` is True.
+
+    The ``'weighted'`` method additionally reports both of those per *binned* (image)
+    pixel (``_DARK_CURRENT_BINNED_COLUMN`` / ``_DARK_CURRENT_BINNED_IMAGE_COLUMN``) --
+    the same rate with no division by ``pixel_binning`` at all, i.e. quoted per image
+    pixel as read out rather than per physical CCD pixel.
+
+    ``per_day=False`` is used for serial-register images (VTRANSF = 'Vtransfer11'),
+    where only the bottom-most CCD row is read out so an exposure-normalised rate is
+    not meaningful -- those images are quoted per image only.
+
+    The single-electron events are counted by:
 
     - ``'count'``: pixels within ``count_nsigma`` peak sigmas of the 1 e- charge,
       divided by the Gaussian fraction ``erf(count_nsigma/sqrt(2))`` to estimate the
@@ -129,22 +146,27 @@ def calculate_dark_current(data_ext, pedestals, gains, double_gauss_popts,
       (``_single_electron_count_integral``; a conservative upper bound).
     - ``'weighted'``: the one-electron amplitude fraction ``N1 / (N1 + N0)``
       (``_single_electron_count_weighted``). This is already per image pixel, so its
-      rate is ``N1/(N1+N0) / pixel_binning / exposure_days`` -- divided only by the
-      binning and exposure, NOT by the pixel count (which cancels in the ratio).
+      rate is ``N1/(N1+N0) / pixel_binning`` (per image, then / ``exposure_days`` for
+      the per-day rate) -- divided only by the binning and exposure, NOT by the pixel
+      count (which cancels in the ratio).
 
     ``method`` may be a single ``'count'``/``'integrate'``/``'weighted'``/``'all'``
     selector, or a list/tuple of any combination of those (``'all'`` expands to every
     method wherever it appears) -- only the requested method(s) are computed.
 
     The detector is read out binned, so each image pixel sums ``pixel_binning``
-    (= NPBIN * NSBIN) physical CCD pixels. The number of physical pixels is therefore
+    (= NPBIN * NSBIN, or NSBIN alone for a serial-register image -- see
+    ``is_serial_register_image``) physical CCD pixels. The number of physical pixels is therefore
     each extension's array size times ``pixel_binning`` (the dark current is quoted per
     *physical* pixel). Since both the event count and the pixel count scale with the
     analysed area, the rate does not depend on how many rows/columns are kept. When the
-    gain is undefined or the exposure time is non-positive/NaN, the result is NaN.
+    gain is undefined the result is NaN; a non-positive/NaN exposure time makes only the
+    per-day rate NaN (the per-image rate does not use the exposure).
 
     Returns a list (one dict per extension) whose keys are the CSV column names in
-    ``_DARK_CURRENT_COLUMN`` for the requested method(s).
+    ``_DARK_CURRENT_COLUMN`` (per day, when ``per_day``) and ``_DARK_CURRENT_IMAGE_COLUMN``
+    (per image) for the requested method(s), plus the ``_DARK_CURRENT_BINNED_*`` columns
+    when ``'weighted'`` is among them.
     """
     methods = _resolve_dark_current_methods(method)
     valid_exposure = np.isfinite(exposure_days) and exposure_days > 0
@@ -158,30 +180,38 @@ def calculate_dark_current(data_ext, pedestals, gains, double_gauss_popts,
         sigma0_adu = popt[0]  # s: shared peak width (= the pedestal/zero-peak width)
         mu1 = popt[2]
 
-        def _rate(n_events):
-            if not (np.isfinite(n_events) and valid_exposure and n_pixels > 0):
-                return np.nan
-            return n_events / n_pixels / exposure_days
-
-        def _weighted_rate(fraction):
-            # The 'weighted' method's n_events is the per-image-pixel fraction
-            # N1/(N1+N0), so it must NOT be divided by the pixel count again (that
-            # cancels in the ratio). Converting to a per-*physical*-pixel/day rate only
-            # needs the binning (physical pixels summed per image pixel) and exposure.
-            if not (np.isfinite(fraction) and valid_exposure and pixel_binning > 0):
-                return np.nan
-            return fraction / pixel_binning / exposure_days
-
         row = {}
+
+        def _add(name, n_events, denominator, day_columns=_DARK_CURRENT_COLUMN,
+                 image_columns=_DARK_CURRENT_IMAGE_COLUMN):
+            # denominator is the physical-pixel count for 'count'/'integrate'. The
+            # 'weighted' method's n_events is instead the per-image-pixel fraction
+            # N1/(N1+N0), so it must NOT be divided by the pixel count again (that
+            # cancels in the ratio) -- reaching a per-*physical*-pixel rate needs only
+            # the binning (physical pixels summed per image pixel), or denominator = 1
+            # for the per-*binned*-pixel columns, which skip that step entirely.
+            if np.isfinite(n_events) and denominator > 0:
+                per_image = n_events / denominator
+            else:
+                per_image = np.nan
+            if per_day:
+                row[day_columns[name]] = (per_image / exposure_days
+                                          if valid_exposure else np.nan)
+            row[image_columns[name]] = per_image
+
         if 'count' in methods:
-            n_events = _single_electron_count_window(
-                data, pedestal, gain, sigma0_adu, mu1, count_center, count_nsigma)
-            row[_DARK_CURRENT_COLUMN['count']] = _rate(n_events)
+            _add('count', _single_electron_count_window(
+                data, pedestal, gain, sigma0_adu, mu1, count_center, count_nsigma),
+                n_pixels)
         if 'integrate' in methods:
-            n_events = _single_electron_count_integral(popt, zero_one_edges_ext[ext], gain)
-            row[_DARK_CURRENT_COLUMN['integrate']] = _rate(n_events)
+            _add('integrate',
+                 _single_electron_count_integral(popt, zero_one_edges_ext[ext], gain),
+                 n_pixels)
         if 'weighted' in methods:
-            n_events = _single_electron_count_weighted(popt, gain)
-            row[_DARK_CURRENT_COLUMN['weighted']] = _weighted_rate(n_events)
+            weighted_events = _single_electron_count_weighted(popt, gain)
+            _add('weighted', weighted_events, pixel_binning)
+            # Same rate per *binned* (image) pixel: no division by the binning at all.
+            _add('weighted', weighted_events, 1, _DARK_CURRENT_BINNED_COLUMN,
+                 _DARK_CURRENT_BINNED_IMAGE_COLUMN)
         rows.append(row)
     return rows

@@ -29,6 +29,7 @@ Code layout (organized by responsibility)
 - ``pedestal``           : pedestal subtraction, overscan handling, and caching.
 - ``fits_io``            : FITS loading and header/geometry readers.
 - ``dark_current``       : dark-current estimation methods.
+- ``poisson_fit``        : Gaussian (x) Poisson(lambda) dark-current fit and image driver.
 - ``plotting``           : zero/one, dark-current, and charge-per-column figures.
 - ``summary``            : per-extension summary tables (CSV).
 - ``__main__``           : command-line entry point (``cli_config`` holds its
@@ -49,6 +50,7 @@ from .core import (
     plot_zero_one_peaks,
     double_gauss,
 )
+from .poisson_fit import analyze_image, fit_poisson_gauss
 
 __all__ = [
     "convert_to_electrons",
@@ -59,4 +61,6 @@ __all__ = [
     "get_zero_one_peaks_ext",
     "plot_zero_one_peaks",
     "double_gauss",
+    "analyze_image",
+    "fit_poisson_gauss",
 ]

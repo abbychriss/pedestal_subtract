@@ -70,6 +70,15 @@ DEFAULT_QUANTITIES = OrderedDict([
     ("noise_e", {"ylabel": "Noise (e-)", "title": "Noise (e-)", "fit_line": False}),
     ("dark_current_weighted_e_per_pix_day", {"ylabel": "DC (e-/pix/day)",
                                              "title": "Dark current", "fit_line": False}),
+    ("dark_current_weighted_e_per_pix_image", {"ylabel": "DC (e-/pix/image)",
+                                               "title": "Dark current (per image)",
+                                               "fit_line": False}),
+    ("dark_current_weighted_e_per_binned_pix_day", {"ylabel": "DC (e-/binned pix/day)",
+                                                    "title": "Dark current (binned pix)",
+                                                    "fit_line": False}),
+    ("dark_current_weighted_e_per_binned_pix_image", {"ylabel": "DC (e-/binned pix/image)",
+                                                      "title": "Dark current (binned pix, per image)",
+                                                      "fit_line": False}),
 ])
 
 
@@ -91,7 +100,8 @@ def _default_template(run_name):
         ("ext_separate_plot", False),
         ("series_separate_plot", True),
         ("plot_individual", True),
-        ("plot_together", True),
+        ("plot_quantities_together", True),
+        ("plot_ext_together", False),
         ("plot_mega", False),
         ("plot_overlaid", False),
         ("show_plots", True),
@@ -101,7 +111,13 @@ def _default_template(run_name):
         ("save_report", True),
         ("individual_figsize", [9, 7]),
         ("together_subplots_figsize", [16, 9]),
-        ("mega_subplots_figsize", [16, 9]),
+        ("mega_subplots_figsize", [16, 4.5]),
+        ("together_legend_fontsize", None),
+        ("mega_legend_fontsize", None),
+        ("font_size", None),
+        ("font_family", None),
+        ("use_tex", False),
+        ("inset_legend", False),
         ("colors", None),
         ("dpi", 450),
         ("use_average", False),
@@ -110,11 +126,11 @@ def _default_template(run_name):
         ("fit_line", False),
         ("connect_points", True),
         ("error_bar_line", True),
-        ("together_subplot_ncols", 3),
+        ("together_subplots_ncols", 3),
         ("series_column", None),
         ("suppress_series_plot", False),
-        ("series_line_styles", ["-", "--"]),
-        ("series_markers", ["o", "^"]),
+        ("series_plot_styles", [{"linestyle": "-", "marker": "o"},
+                                {"linestyle": "--", "marker": "^"}]),
         ("uniform_series_style", False),
         ("quantities", OrderedDict(DEFAULT_QUANTITIES)),
         ("datasets", []),
@@ -363,11 +379,11 @@ NO_ACTIVE_RUN = "no_active_run"
 def append_dataset(table_path, x="", series="", exclude_ext=None):
     """Append a dataset entry for ``table_path`` to the active run's JSON.
 
-    The entry is ``{"x": x, "exclude_ext": exclude_ext or [], "series": series,
-    "table": <absolute path>}``. If the same table path is already present the
-    call is a no-op (de-duplication), so re-running an analysis will not add the
-    same CSV twice. Returns one of ``APPENDED``, ``DUPLICATE`` or
-    ``NO_ACTIVE_RUN``.
+    The entry is ``{"x": x, "exclude_ext": exclude_ext or [], "exclude_dataset":
+    False, "comments": "", "series": series, "table": <absolute path>}``. If the
+    same table path is already present the call is a no-op (de-duplication), so
+    re-running an analysis will not add the same CSV twice. Returns one of
+    ``APPENDED``, ``DUPLICATE`` or ``NO_ACTIVE_RUN``.
     """
     state = active_run()
     if state is None:
@@ -388,6 +404,8 @@ def append_dataset(table_path, x="", series="", exclude_ext=None):
     datasets.append(OrderedDict([
         ("x", x),
         ("exclude_ext", list(exclude_ext) if exclude_ext else []),
+        ("exclude_dataset", False),
+        ("comments", ""),
         ("series", series),
         ("table", table_abs),
     ]))

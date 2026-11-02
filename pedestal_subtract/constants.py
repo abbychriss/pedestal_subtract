@@ -33,10 +33,38 @@ _MIN_GAIN_ADU = 0.5
 _MAX_GAIN_ADU = 1.8
 
 
+# Per-day dark-current CSV column per method (electrons / physical pixel / day).
+# Omitted for serial-register images (VTRANSF = 'Vtransfer11'), which are quoted per
+# image instead -- see _DARK_CURRENT_IMAGE_COLUMN.
 _DARK_CURRENT_COLUMN = {
     'count': 'dark_current_count_e_per_pix_day',
     'integrate': 'dark_current_integrate_e_per_pix_day',
     'weighted': 'dark_current_weighted_e_per_pix_day',
+}
+
+
+# Per-image dark-current CSV column per method (electrons / physical pixel / image):
+# the same quantity as _DARK_CURRENT_COLUMN but *not* divided by the exposure in days.
+# Written for every image (regular and serial-register).
+_DARK_CURRENT_IMAGE_COLUMN = {
+    'count': 'dark_current_count_e_per_pix_image',
+    'integrate': 'dark_current_integrate_e_per_pix_image',
+    'weighted': 'dark_current_weighted_e_per_pix_image',
+}
+
+
+# Dark-current CSV columns per *binned* (image) pixel: the same rates as
+# _DARK_CURRENT_COLUMN / _DARK_CURRENT_IMAGE_COLUMN but WITHOUT dividing by the pixel
+# binning, i.e. quoted per image pixel as read out rather than per physical CCD pixel.
+# Only the 'weighted' method carries these; as with the per-day columns above, the
+# per-day one is omitted for serial-register images.
+_DARK_CURRENT_BINNED_COLUMN = {
+    'weighted': 'dark_current_weighted_e_per_binned_pix_day',
+}
+
+
+_DARK_CURRENT_BINNED_IMAGE_COLUMN = {
+    'weighted': 'dark_current_weighted_e_per_binned_pix_image',
 }
 
 

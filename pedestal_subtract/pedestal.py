@@ -250,7 +250,7 @@ def pedestal_subtract_ext_cached(data_ext, source_path, n_std_to_mask, axis='row
                                        use_biweight_loc, use_biweight_midvar, max_iter,
                                        overscan_cols_ext):
                 if verbose:
-                    print(f'Loading cached pedestal-subtracted data from {cache_path}')
+                    print(f'\nLoading cached pedestal-subtracted data from {cache_path}')
                 return [hdul[i].data.copy() for i in range(1, len(hdul))]
             elif verbose:
                 print(f'Cached params at {cache_path} differ from current; recomputing.')

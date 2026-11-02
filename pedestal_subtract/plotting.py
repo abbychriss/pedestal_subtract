@@ -9,9 +9,16 @@ from pathlib import Path
 from scipy.optimize import curve_fit
 
 from analysis_tools import plot_charge_per_column
+from analysis_tools.plot_charge_per_column import format_title
 
 from .calibrate import convert_to_electrons
+from .constants import (_DARK_CURRENT_BINNED_IMAGE_COLUMN, _DARK_CURRENT_COLUMN,
+                        _DARK_CURRENT_IMAGE_COLUMN)
 from .double_gauss_model import double_gauss
+
+# Every figure here already uses constrained_layout=True; widen its default padding (inches)
+# a little. Set once at import since nonlinearity_studies plots through this module too.
+plt.rcParams.update({'figure.constrained_layout.h_pad': 0.1, 'figure.constrained_layout.w_pad': 0.1})
 
 _SUBPLOTS_FIGSIZE = (13, 9)
 
@@ -142,9 +149,9 @@ def _zero_one_label_adu(double_gauss_popt, gain):
                          double_gauss_popt[3], double_gauss_popt[4])
     if np.isnan(gain):
         return (r'$\sigma$ = %5.3f, $\mu_0$ = %5.3f, $N_0$ = %5.3f' % (s, m0, N0)
-                + '\n' + r'no $1\,e^{–}$ peak found (gain undefined)')
+                + '\n' + r'no $1\,e^{-}$ peak found (gain undefined)')
     return (r'$\sigma$ = %5.3f, $\mu_0$ = %5.3f, $\mu_1$ = %5.3f,' % (s, m0, m1)
-            + '\n' + r'$N_0$ = %5.3f, $N_1$ = %5.3f, gain = %5.3f ADU/$e^{–}$' % (N0, N1, gain))
+            + '\n' + r'$N_0$ = %5.3f, $N_1$ = %5.3f, gain = %5.3f ADU/$e^{-}$' % (N0, N1, gain))
 
 
 def plot_zero_one_peaks(data_ext,
@@ -159,7 +166,7 @@ def plot_zero_one_peaks(data_ext,
                         xlim='default',
                         ylim='default',
                         ylim_electrons='default',
-                        suptitle='Double-Gaussian Fit to Zero-One Electron Peaks',
+                        suptitle='Calibration Fit to Zero-One Peaks',
                         additional_title='',
                         nimages=10,
                         fontsize=9.5,
@@ -202,7 +209,7 @@ def plot_zero_one_peaks(data_ext,
 
             fig, ax = plt.subplots(1, 1, figsize=individual_figsize, constrained_layout=True)
             if show_titles:
-                ax.set_title(f'{additional_title}{suptitle} (Nimages = {nimages}): EXT {ext + 1}', fontsize=12, pad=10)
+                ax.set_title(format_title(additional_title, suptitle, nimages, f'EXT {ext + 1}'), pad=10)
             ax.set_xlabel('Charge (ADU)')
             ax.set_ylabel('N')
 
@@ -217,7 +224,7 @@ def plot_zero_one_peaks(data_ext,
             curve_x = _fit_curve_x(zero_one_range[0], zero_one_range[1], len(zero_one_counts))
             ax.plot(curve_x, double_gauss(curve_x, *double_gauss_popt), 'r',
                 label=_zero_one_label_adu(double_gauss_popt, gain))
-            ax.legend(loc="upper right", fontsize=fontsize)
+            ax.legend(loc="upper right")
 
             if xlim=='default':
                 ax.set_xlim(zero_one_range[0], zero_one_range[1])
@@ -272,7 +279,7 @@ def plot_zero_one_peaks(data_ext,
 
             fig, ax = plt.subplots(1, 1, figsize=individual_figsize, constrained_layout=True)
             if show_titles:
-                ax.set_title(rf'{additional_title}{suptitle} (Nimages = {nimages}): EXT {ext + 1}', fontsize=12, pad=10)
+                ax.set_title(format_title(additional_title, suptitle, nimages, f'EXT {ext + 1}'), pad=10)
 
             if yscale=='log':
                 ax.set_yscale('log')
@@ -280,13 +287,13 @@ def plot_zero_one_peaks(data_ext,
                 ax.set_yscale(yscale)
 
             ax.stairs(_bar_heights(zero_one_counts_e, yscale), zero_one_edges_e, fill=True)
-            ax.set_xlabel(r'Charge ($e^–$)')
+            ax.set_xlabel(r'Charge ($e^-$)')
             ax.set_ylabel('N')
             curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(zero_one_counts_e))
             ax.plot(curve_x_e, double_gauss(curve_x_e, *double_gauss_popt_e), 'r',
-                label=r'$\sigma$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:3]
-                +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
-            ax.legend(loc="upper right", fontsize=fontsize)
+                label=r'$\sigma$ = %5.3f $e^{-}$, $\mu_0$ = %5.3f $e^{-}$, $\mu_1$ = %5.3f $e^{-}$,'%tuple(double_gauss_popt_e)[0:3]
+                +'\n'+'gain = %5.3f ADU/$e^{-}$'%gain)
+            ax.legend(loc="upper right")
 
             if xlim=='default':
                 ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
@@ -311,7 +318,7 @@ def plot_zero_one_peaks(data_ext,
     if plot_adu_together:
         fig, axs = plt.subplots(2, 2, figsize=subplots_figsize, constrained_layout=True, sharex=sharex, sharey=sharey)
         if show_titles:
-            fig.suptitle(f'{additional_title}{suptitle} (Nimages = {nimages})')
+            fig.suptitle(format_title(additional_title, suptitle, nimages))
         axs = axs.flatten()
 
         _ylims = []
@@ -341,7 +348,7 @@ def plot_zero_one_peaks(data_ext,
             ax.set_xlabel('Charge (ADU)')
             ax.set_ylabel('N')
             ax.set_title(f'EXT {ext + 1}')
-            ax.legend(loc="upper right", fontsize=fontsize - 2)
+            ax.legend(loc="upper right")
 
             if xlim=='default':
                 ax.set_xlim(zero_one_range[0], zero_one_range[1])
@@ -377,7 +384,7 @@ def plot_zero_one_peaks(data_ext,
     if plot_electrons_together:
         fig, axs = plt.subplots(2, 2, figsize=subplots_figsize, constrained_layout=True, sharex=sharex, sharey=sharey)
         if show_titles:
-            fig.suptitle(rf'{additional_title}{suptitle} (Nimages = {nimages})')
+            fig.suptitle(format_title(additional_title, suptitle, nimages))
         axs = axs.flatten()
 
         _ylims = []
@@ -393,9 +400,9 @@ def plot_zero_one_peaks(data_ext,
             # electrons; leave the subplot empty with a note and move on.
             if np.isnan(gain):
                 ax.set_title(f'EXT {ext + 1}')
-                ax.set_xlabel(r'Charge ($e^–$)')
+                ax.set_xlabel(r'Charge ($e^-$)')
                 ax.set_ylabel('N')
-                ax.text(0.5, 0.5, r'no $1\,e^{–}$ peak found',
+                ax.text(0.5, 0.5, r'no $1\,e^{-}$ peak found',
                         ha='center', va='center', transform=ax.transAxes)
                 _ylims.append(None)
                 continue
@@ -429,10 +436,10 @@ def plot_zero_one_peaks(data_ext,
             curve_x_e = _fit_curve_x(zero_one_range_e[0], zero_one_range_e[1], len(zero_one_counts_e))
             fit_y_e = double_gauss(curve_x_e, *double_gauss_popt_e)
             ax.plot(curve_x_e, fit_y_e, 'r',
-                label=r'$\sigma$ = %5.3f $e^{–}$, $\mu_0$ = %5.3f $e^{–}$, $\mu_1$ = %5.3f $e^{–}$,'%tuple(double_gauss_popt_e)[0:3]
-                +'\n'+'gain = %5.3f ADU/$e^{–}$'%gain)
-            ax.legend(loc="upper right", fontsize=fontsize - 2)
-            ax.set_xlabel(r'Charge ($e^–$)')
+                label=r'$\sigma$ = %5.3f $e^{-}$, $\mu_0$ = %5.3f $e^{-}$, $\mu_1$ = %5.3f $e^{-}$,'%tuple(double_gauss_popt_e)[0:3]
+                +'\n'+'gain = %5.3f ADU/$e^{-}$'%gain)
+            ax.legend(loc="upper right")
+            ax.set_xlabel(r'Charge ($e^-$)')
             ax.set_ylabel('N')
 
             if xlim=='default':
@@ -464,6 +471,35 @@ def plot_zero_one_peaks(data_ext,
         _finish_fig(show_plots)
 
 
+def _dark_current_legend_label(dc_row, method):
+    """Legend text for one method's dark current, or ``None`` when it was not computed.
+
+    Regular images are quoted per day (e-/pix/day). Serial-register images
+    (VTRANSF = 'Vtransfer11') carry no per-day column -- only the bottom-most CCD row is
+    read out, so an exposure-normalised rate is not meaningful -- and are instead quoted
+    per image on one line per available normalisation: per binned (image) pixel
+    ('weighted' only) and per physical pixel. For 1x1 binning the two are identical, so
+    only the per-pixel line is shown. Columns absent from ``dc_row`` are skipped, and
+    continuation lines are indented so the rates line up under one another.
+    """
+    if _DARK_CURRENT_COLUMN[method] in dc_row:
+        columns = ((_DARK_CURRENT_COLUMN, r'$e^-$/pix/day'),)
+    else:
+        columns = ((_DARK_CURRENT_IMAGE_COLUMN, r'$e^-$/pix/image'),)
+        # The per-binned-pixel rate equals the per-pixel rate exactly when
+        # pixel_binning == 1 (both are per_image / 1), so it only adds information
+        # for binned images.
+        binned = _DARK_CURRENT_BINNED_IMAGE_COLUMN.get(method)
+        if binned in dc_row and dc_row[binned] != dc_row[_DARK_CURRENT_IMAGE_COLUMN[method]]:
+            columns = ((_DARK_CURRENT_BINNED_IMAGE_COLUMN, r'$e^-$/binned pix/image'),) + columns
+    rates = [f'{dc_row[column]:.3g} {unit}' for columns_by_method, unit in columns
+             if (column := columns_by_method.get(method)) in dc_row]
+    if not rates:
+        return None
+    return '\n'.join(f'{"dark current" if i == 0 else "":>12} = {rate}'
+                     for i, rate in enumerate(rates))
+
+
 def _dark_current_fit_label(sigma_e, gain, N1):
     """Legend text for the fit curve: shared width (e-), gain, and 1 e- amplitude N1."""
     return (r'$\sigma$ = %.3f $e^-$' % sigma_e
@@ -472,8 +508,7 @@ def _dark_current_fit_label(sigma_e, gain, N1):
 
 def _draw_dark_current_ax(ax, ext, data, zero_one_counts_ext, pedestals, gains,
                           double_gauss_popts, zero_one_ranges, dark_current_rows,
-                          count_center, count_nsigma, electron_fit_mode, yscale,
-                          legend_fontsize):
+                          count_center, count_nsigma, electron_fit_mode, yscale):
     """Draw one extension's dark-current window plot onto ``ax``.
 
     Shared by both the combined 2x2 grid and the individual per-extension figures so
@@ -513,7 +548,7 @@ def _draw_dark_current_ax(ax, ext, data, zero_one_counts_ext, pedestals, gains,
 
     # Each dark-current method actually present in dark_current_rows gets its own,
     # independent legend entry -- these are not mutually exclusive.
-    dc_count = dark_current_rows[ext].get('dark_current_count_e_per_pix_day')
+    dc_count = _dark_current_legend_label(dark_current_rows[ext], 'count')
     if dc_count is not None:
         # 'count' method was used: draw its +/- count_nsigma * sigma window about the
         # 1 e- charge, computed in ADU exactly as the method does, then converted to
@@ -525,31 +560,29 @@ def _draw_dark_current_ax(ax, ext, data, zero_one_counts_ext, pedestals, gains,
         lo_e = (center_adu - count_nsigma * sigma_adu - pedestal) / gain
         hi_e = (center_adu + count_nsigma * sigma_adu - pedestal) / gain
         window_label = (rf'count (window $\pm${count_nsigma:g}$\,\sigma$)'
-                        + '\n' + r'dark current = %.3g $e^-$/pix/day' % dc_count)
+                        + '\n' + dc_count)
         ax.axvline(lo_e, color='k', linestyle=':', linewidth=1.2, label=window_label)
         ax.axvline(hi_e, color='k', linestyle=':', linewidth=1.2)
 
-    dc_integrate = dark_current_rows[ext].get('dark_current_integrate_e_per_pix_day')
+    dc_integrate = _dark_current_legend_label(dark_current_rows[ext], 'integrate')
     if dc_integrate is not None:
         # 'integrate' method was used: shade the area under the fitted one-electron
         # Gaussian component (reusing popt_e/curve_x_e from the fit curve above, so
         # the shading matches it exactly) and label it with the method's dark current.
         one_e_curve = popt_e[4] * np.exp(-(curve_x_e - popt_e[2])**2 / (2 * popt_e[0]**2))
-        integrate_label = (r'integrate (1$e^-$ Gaussian)'
-                           + '\n' + r'dark current = %.3g $e^-$/pix/day' % dc_integrate)
+        integrate_label = r'integrate (1$e^-$ Gaussian)' + '\n' + dc_integrate
         ax.fill_between(curve_x_e, one_e_curve, color='#ff7f0e', alpha=0.4,
                         label=integrate_label)
 
-    dc_weighted = dark_current_rows[ext].get('dark_current_weighted_e_per_pix_day')
+    dc_weighted = _dark_current_legend_label(dark_current_rows[ext], 'weighted')
     if dc_weighted is not None:
         # 'weighted' method was used: report its dark current and formula as a
         # legend-only entry (no corresponding visual element).
         ax.plot([], [], ' ',
-                label=(r'weighted (SER = $N_1$ / $(N_1 + N_0)$)' \
-                       + '\n' + 'dark current = %.3g $e^-$/pix/day' % dc_weighted))
+                label=r'weighted (SER = $N_1$ / $(N_1 + N_0)$)' + '\n' + dc_weighted)
 
     ax.set_xlim(zero_one_range_e[0], zero_one_range_e[1])
-    ax.legend(loc='upper right', fontsize=legend_fontsize)
+    ax.legend(loc='upper right')
 
 
 def plot_dark_current_zero_one(data_ext, zero_one_counts_ext, zero_one_edges_ext,
@@ -588,13 +621,12 @@ def plot_dark_current_zero_one(data_ext, zero_one_counts_ext, zero_one_edges_ext
         for ext, data in enumerate(data_ext):
             fig, ax = plt.subplots(1, 1, figsize=individual_figsize, constrained_layout=True)
             if show_titles:
-                ax.set_title(f'{additional_title}{suptitle} (Nimages = {nimages}): EXT {ext + 1}',
-                            fontsize=12, pad=10)
+                ax.set_title(format_title(additional_title, suptitle, nimages, f'EXT {ext + 1}'),
+                            pad=10)
 
             _draw_dark_current_ax(ax, ext, data, zero_one_counts_ext, pedestals, gains,
                                   double_gauss_popts, zero_one_ranges, dark_current_rows,
-                                  count_center, count_nsigma, electron_fit_mode, yscale,
-                                  legend_fontsize=fontsize)
+                                  count_center, count_nsigma, electron_fit_mode, yscale)
 
             if save_plots:
                 output_path = fig_path / f'{base_name}_EXT{ext+1}.jpeg'
@@ -605,7 +637,7 @@ def plot_dark_current_zero_one(data_ext, zero_one_counts_ext, zero_one_edges_ext
     if plot_together:
         fig, axs = plt.subplots(2, 2, figsize=subplots_figsize, constrained_layout=True)
         if show_titles:
-            fig.suptitle(f'{additional_title}{suptitle} (Nimages = {nimages})')
+            fig.suptitle(format_title(additional_title, suptitle, nimages))
         axs = axs.flatten()
 
         for ext, data in enumerate(data_ext):
@@ -614,8 +646,7 @@ def plot_dark_current_zero_one(data_ext, zero_one_counts_ext, zero_one_edges_ext
 
             _draw_dark_current_ax(ax, ext, data, zero_one_counts_ext, pedestals, gains,
                                   double_gauss_popts, zero_one_ranges, dark_current_rows,
-                                  count_center, count_nsigma, electron_fit_mode, yscale,
-                                  legend_fontsize=fontsize - 2)
+                                  count_center, count_nsigma, electron_fit_mode, yscale)
 
         if save_plots:
             output_path = fig_path / f'{base_name}.jpeg'

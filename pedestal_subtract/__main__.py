@@ -33,6 +33,13 @@ from .core import (
     get_fits_header,
     get_exposure_time_days,
     get_pixel_binning,
+    is_serial_register_image,
+    _SERIAL_REGISTER_VTRANSF,
+    _DARK_CURRENT_COLUMN,
+    _DARK_CURRENT_IMAGE_COLUMN,
+    _DARK_CURRENT_BINNED_COLUMN,
+    _DARK_CURRENT_BINNED_IMAGE_COLUMN,
+    _DARK_CURRENT_METHODS,
     raw_pedestal_locations,
     overscan_cols_from_header,
     pedestal_subtract_ext_cached,
@@ -523,9 +530,7 @@ def main(argv=None):
             # absolute, so it overrides stitch_fits's own file_path/out_path join.
             out_path = (_wildcard_free_base(args.file_string) / stitched_dir_name).resolve()
             stitched_file = stitch_fits(
-                input_dir.parent,
-                directory=input_dir.name,
-                image=input_pattern,
+                input_dir / input_pattern,
                 out_path=out_path,
                 print_header=args.verbose,
             )
@@ -620,6 +625,7 @@ def main(argv=None):
             show_titles=args.show_titles if args.show_titles is not None else True,
             nimages=nimages,
             verbose=args.verbose,
+            col_offset=int(get_fits_header(file_path).get('NCOLPRE', 0)),
             save_plots=args.save_output,
             show_plots=args.show_plots,
             fig_path=str(fig_path),
@@ -675,15 +681,15 @@ def main(argv=None):
         ]
         if args.verbose:
             kept = [int(m.sum()) if m is not None else None for m in fit_cols_ext]
-            print(f'Restricting the fit columns per extension: spec={fit_cols_spec}, '
-                  f'kept_columns={kept}')
+            print(f'\nRestricting the fit columns per extension: {fit_cols_spec}, '
+                  f'ncols kept: {kept}')
 
     if args.verbose and fit_params['gain_seed'] is not None:
         # Show the per-extension gain seeds actually applied (resolved with the same
         # helper the fit uses), so a single value is reported as the list it broadcasts to.
         gain_seeds_ext = [_scalar_for_extension(fit_params['gain_seed'], ext, len(data_ext))
                           for ext in range(len(data_ext))]
-        print(f'Using guess for gains: {gain_seeds_ext}')
+        print(f'\nUsing guess for gains: {gain_seeds_ext}')
 
     (zero_one_counts_ext, zero_one_edges_ext, pedestals, gains,
      double_gauss_popts, zero_one_ranges) = get_zero_one_peaks_ext(
@@ -723,22 +729,34 @@ def main(argv=None):
             total_s = exposure_days * 86400
             hours = int(total_s // 3600)
             minutes = int((total_s % 3600) // 60)
-            print(f'Exposure time: {exposure_days:.6f} days / '
+            print(f'\nExposure time: {exposure_days:.6f} days / '
                   f'{hours}hr:{minutes:02d}min / {total_s:.1f} s\n')
 
     # Pixel binning (NPBIN x NSBIN): each image pixel sums that many physical CCD
     # pixels, so the dark current (per physical pixel) divides by the binned factor.
+    # Exception: serial-register images (VTRANSF = 'Vtransfer11') read out only the
+    # bottom-most CCD row, so the vertical transfer never sums NPBIN rows -- only the
+    # serial binning NSBIN counts.
     npbin, nsbin = get_pixel_binning(file_path)
     if npbin is None or nsbin is None:
         print(f'Warning: NPBIN/NSBIN not found in the FITS headers (got NPBIN={npbin}, '
               f'NSBIN={nsbin}); assuming no binning (factor 1) for the dark current.\n')
-    pixel_binning = (npbin or 1) * (nsbin or 1)
+    serial_register = is_serial_register_image(file_path)
+    pixel_binning = (nsbin or 1) if serial_register else (npbin or 1) * (nsbin or 1)
     if args.verbose:
-        print(f'Pixel binning: NPBIN={npbin}, NSBIN={nsbin} -> {pixel_binning} '
-              f'physical pixels per image pixel\n')
+        if serial_register:
+            print(f"Serial-register image (VTRANSF = '{_SERIAL_REGISTER_VTRANSF}'): "
+                  f'NSBIN={nsbin} -> {pixel_binning} physical pixel(s) per image pixel; '
+                  'dark current quoted per image (e-/pix/image), not per day\n')
+        else:
+            print(f'Pixel binning: NPBIN={npbin}, NSBIN={nsbin} -> {pixel_binning} '
+                  f'physical pixels per image pixel\n')
 
-    # Per-extension dark current (electrons / physical pixel / day), by the chosen
-    # method(s). Skipped entirely when --no-do_dark_current / "do_dark_current": false:
+    # Per-extension dark current by the chosen method(s): always per image
+    # (electrons / physical pixel / image), plus per day (/ exposure_days) for regular
+    # images -- serial-register images read out only one CCD row, so the exposure-
+    # normalised rate is not meaningful and only the per-image column is written.
+    # Skipped entirely when --no-do_dark_current / "do_dark_current": false:
     # dark_current_rows stays None so the summary CSV and plot omit the column(s).
     if args.do_dark_current:
         dark_current_rows = calculate_dark_current(
@@ -747,6 +765,7 @@ def main(argv=None):
             count_center=args.dark_current_count_center,
             count_nsigma=args.dark_current_count_nsigma,
             pixel_binning=pixel_binning,
+            per_day=not serial_register,
         )
     else:
         dark_current_rows = None
@@ -765,15 +784,22 @@ def main(argv=None):
             continue
         dc = dark_current_rows[ext]
         dc_parts = []
-        if 'dark_current_count_e_per_pix_day' in dc:
-            dc_parts.append(f"count (±{args.dark_current_count_nsigma:g}σ0) = "
-                            f"{dc['dark_current_count_e_per_pix_day']:.4g}")
-        if 'dark_current_integrate_e_per_pix_day' in dc:
-            dc_parts.append(f"integrate = {dc['dark_current_integrate_e_per_pix_day']:.4g}")
-        if 'dark_current_weighted_e_per_pix_day' in dc:
-            dc_parts.append(f"weighted = {dc['dark_current_weighted_e_per_pix_day']:.4g}")
+        for dc_method in _DARK_CURRENT_METHODS:
+            # Each computed method reports its per-day rate (omitted for serial-register
+            # images) and its per-day-independent per-image rate side by side.
+            values = [f'{dc[column]:.4g} {unit}' for column, unit in
+                      ((_DARK_CURRENT_COLUMN[dc_method], 'e-/pix/day'),
+                       (_DARK_CURRENT_IMAGE_COLUMN[dc_method], 'e-/pix/image'),
+                       (_DARK_CURRENT_BINNED_COLUMN.get(dc_method), 'e-/binned pix/day'),
+                       (_DARK_CURRENT_BINNED_IMAGE_COLUMN.get(dc_method),
+                        'e-/binned pix/image'))
+                      if column in dc]
+            if values:
+                label = (f"count (±{args.dark_current_count_nsigma:g}σ0)"
+                         if dc_method == 'count' else dc_method)
+                dc_parts.append(f"{label} = {' / '.join(values)}")
         if dc_parts:
-            print(f"         dark current (e-/pix/day): {', '.join(dc_parts)}")
+            print(f"         dark current: {', '.join(dc_parts)}")
     print()
 
     if args.save_output:
@@ -825,7 +851,7 @@ def main(argv=None):
             ylim=args.plot_zero_one_ylim,
             ylim_electrons=args.plot_zero_one_ylim_electrons,
             additional_title=args.extra_plot_title if args.extra_plot_title else '',
-            suptitle='Double-Gaussian Fit to Zero-One Electron Peaks',
+            suptitle='Calibration Fit to Zero-One Peaks',
             nimages=nimages,
             fontsize=12,
             save_plots=args.save_output,

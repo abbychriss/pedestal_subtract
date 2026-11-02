@@ -27,7 +27,7 @@ def calculate_noise_gain(data, zero_one_test_range='auto', n_bins=_ZERO_ONE_N_BI
     # Imported here rather than at module top to break the calibrate <-> fit_zero_one
     # import cycle: fit_zero_one imports calculate_noise_gain, and these zero/one setup
     # helpers live alongside it. Keeping calibrate import-time leaf-only avoids the cycle.
-    from .fit_zero_one import _auto_zero_one_setup, _clip_to_bounds
+    from .fit_zero_one import _auto_zero_one_setup, _clip_to_bounds, _estimate_one_peak_amplitude
 
     data = np.array(data).flatten()
     data = data[np.isfinite(data)]
@@ -66,19 +66,47 @@ def calculate_noise_gain(data, zero_one_test_range='auto', n_bins=_ZERO_ONE_N_BI
     if sigma_right <= 0 or not np.isfinite(sigma_right) or fit_mask.sum() < 6:
         fit_mask = np.ones_like(zero_one_centers, dtype=bool)
 
-    # Poisson-weight the fit (sigma = sqrt(counts)): unweighted least squares is
-    # dominated by the ~1e4-count zero-peak core, so stretching sigma / shifting mu_0
-    # to soak up the ~10-count one-electron region costs the fit almost nothing and
-    # the second Gaussian is left parked anywhere. Weighting makes low-count bins
-    # matter in proportion to their statistical error, penalizing exactly that.
-    popt, pcov = curve_fit(double_gauss, zero_one_centers[fit_mask],
-                           zero_one_counts[fit_mask], p0=p0,
-                           maxfev=20000, bounds=fit_bounds,
-                           sigma=np.sqrt(np.maximum(zero_one_counts[fit_mask], 1.0)),
-                           absolute_sigma=True)
+    # Two-stage fit. Stage 1 is an UNWEIGHTED least-squares fit of all 5 parameters:
+    # unweighted LSQ is dominated by the ~1e4-count zero-peak core (the one-electron
+    # region costs it almost nothing), which is exactly what we want here -- sigma,
+    # mu_0, and N0 come out set by the bright, well-determined pedestal, not perturbed
+    # by whatever the one-electron peak's amplitude/location happen to do. We keep
+    # s, mu_0, and N0 from this stage and fix all three going into stage 2.
+    popt_stage1, _ = curve_fit(double_gauss, zero_one_centers[fit_mask],
+                               zero_one_counts[fit_mask], p0=p0,
+                               maxfev=20000, bounds=fit_bounds)
+    s_fit, m0_fit, N0_fit = popt_stage1[0], popt_stage1[1], popt_stage1[3]
 
-    # Extract pedestal, noise, and the double-Gaussian coefficients from the fit.
-    s_fit, m0_fit, m1_fit, N0_fit, N1_fit = popt
+    # Stage 2 refits only mu_1 and N1, with sigma, mu_0, and N0 FIXED at the stage-1
+    # values, using a Poisson weight (sigma = sqrt(counts)) so the low-count
+    # one-electron region gets to pull mu_1/N1 in proportion to its statistical error
+    # rather than being steamrolled by the zero-peak core.
+    #
+    # N1's seed/bounds are recomputed here (rather than reusing fit_zero_one's
+    # pre-fit p0/bounds) from the now-fitted mu_0/sigma: the "tallest bin >= 3 sigma
+    # to the right of mu_0" cutoff needs the real sigma to actually clear the zero
+    # peak's tail. Anchoring it to the pre-fit heuristic estimate (which can run
+    # narrower than the true sigma) leaves the cutoff sitting inside the zero peak's
+    # shoulder, which is still substantial there -- picking that up as "N1" overstates
+    # the one-electron amplitude by orders of magnitude.
+    m1_low, m1_high = fit_bounds[0][2], fit_bounds[1][2]
+    one_peak_count, n1_low, n1_high = _estimate_one_peak_amplitude(
+        zero_one_centers, zero_one_counts, m0_fit, s_fit, N0_fit)
+
+    def _double_gauss_fixed_width_mean_n0(x, m1, N1):
+        return double_gauss(x, s_fit, m0_fit, m1, N0_fit, N1)
+
+    p0_stage2 = _clip_to_bounds([p0[2], one_peak_count], ([m1_low, n1_low], [m1_high, n1_high]))
+    bounds_stage2 = ([m1_low, n1_low], [m1_high, n1_high])
+    popt_stage2, pcov = curve_fit(_double_gauss_fixed_width_mean_n0, zero_one_centers[fit_mask],
+                                  zero_one_counts[fit_mask], p0=p0_stage2,
+                                  maxfev=20000, bounds=bounds_stage2,
+                                  sigma=np.sqrt(np.maximum(zero_one_counts[fit_mask], 1.0)),
+                                  absolute_sigma=True)
+    m1_fit, N1_fit = popt_stage2
+    popt = np.array([s_fit, m0_fit, m1_fit, N0_fit, N1_fit])
+
+    # Extract pedestal and noise from the fit.
     pedestal = m0_fit  # Pedestal is mean of the zero-electron peak
     noise = s_fit      # Noise is the shared peak width (std of the zero-electron peak)
 

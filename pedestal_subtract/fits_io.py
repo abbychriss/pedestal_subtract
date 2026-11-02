@@ -9,6 +9,10 @@ from pathlib import Path
 
 _OVERSCAN_HEADER_KEYS = ('PRESCAN', 'PHYSCOL', 'NCOL', 'NCOLPRE', 'NSBIN')
 
+# VTRANSF value marking a serial-register readout (only the serial register -- the
+# bottom-most CCD row -- is read out); regular images use 'Vtransfer22'.
+_SERIAL_REGISTER_VTRANSF = 'Vtransfer11'
+
 
 def get_fits(file_input):
     """
@@ -94,6 +98,29 @@ def get_pixel_binning(file_input):
             if npbin is not None and nsbin is not None:
                 break
     return npbin, nsbin
+
+
+def is_serial_register_image(file_input):
+    """True when the FITS headers mark this as a serial-register readout (VTRANSF).
+
+    Serial-register images use a different readout sequence from regular images: only
+    the bottom-most CCD row (the serial register) is actually read out, so the vertical
+    transfer does not accumulate charge from NPBIN rows the way a regular readout does.
+    Regular images carry ``VTRANSF = 'Vtransfer22'``; serial-register images carry
+    ``VTRANSF = 'Vtransfer11'``. Scans every HDU (primary + extensions) for the key and
+    compares case-insensitively, ignoring surrounding whitespace.
+
+    Returns ``False`` when the key is absent (assume a regular image).
+    """
+    file_path = Path(file_input).resolve()
+    if not file_path.exists():
+        raise FileNotFoundError(f"FITS file not found: {file_path}")
+
+    with fits.open(str(file_path)) as hdu_list:
+        for hdu in hdu_list:
+            if 'VTRANSF' in hdu.header:
+                return str(hdu.header['VTRANSF']).strip().lower() == _SERIAL_REGISTER_VTRANSF.lower()
+    return False
 
 
 def raw_pedestal_locations(data_ext, use_biweight=False):

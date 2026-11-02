@@ -98,6 +98,7 @@ python -m pedestal_subtract --help
 | `--zero_one_window_right_scale` | `1.0` | Scale the right half-width of the auto-computed zero/one fit window (≥ 1.0; > 1 widens past the one-electron peak). Widening coarsens the bin width (see `--zero_one_n_bins`). |
 | `--fit_cols SPEC ...` | all columns | Restrict the zero/one fit (and the plotted histograms) to image columns. A region is a Python half-open slice `START:STOP` (either end may be blank — `3400:` runs to the end, `:3200` from the start; negative endpoints count from the right). Join several regions with commas to keep their **union**, e.g. `0:3200,3400:3500`. Pass `auto` to keep every column **except** the hot ones (median charge ≥ `--n_std_to_mask` biweight-SDs from the pedestal location — the same columns drawn red by `--plot_charge_per_column`); a manual region entry overrides `auto`. Give one value to apply it to **every** extension, or one **per** extension (use `null` for an extension to keep all its columns). Bare integers still work for a single range: two ints (`START STOP`) for all extensions, or two per extension (e.g. 8 ints for 4 extensions). In the JSON config use `"auto"`, a `"lo:hi,lo:hi"` string, a `[START, STOP]` pair, or a per-extension list of those/`null` (e.g. `["0:3200,3400:3500", null, "auto", [10, -10]]`). Applied **after** pedestal subtraction, so the per-row pedestal / overscan estimate still uses the full frame. Omit to use every column. |
 | `--zero_one_gain_guess GAIN ...` | auto-detect | Seed for the one-electron peak location — a guess for the gain (ADU/e⁻). The seed places `μ₁` at `μ₀ + gain` and **restricts the fit bound on `μ₁` to a tight ±0.05 ADU band** around that location, so the fit stays on the guessed peak instead of sliding down onto the zero-peak tail. It does **not** affect the fit window size or the binning (those come from the auto-detected bump and `--zero_one_n_bins`). The post-fit acceptance band (gain ∈ [0.5, 1.8] ADU/e⁻) is unchanged. Pass one value to apply it to **every** extension, or one **per** extension (e.g. 4 values for 4 extensions). In the JSON config use a single number or a per-extension list of numbers/`null` (e.g. `[1.05, null, 0.95, 1.1]`, where `null` auto-detects that extension). Values must be > 0. Omit to auto-detect for all. |
+| `poisson_kmax` (config / `analyze_image` kwarg) | `3` | Highest electron number *k* summed in the Poisson ⊗ Gaussian model (see below). λ ≪ 1 needs only 0 and 1, so raise it only for high dark current / large binning. |
 | `--force_pedsub` | off | Recompute, ignoring the on-disk cache. |
 | `--pedsub_cache_dir DIR` | `cache/` beside source | Where to write the `*.pedsub.fits` cache. |
 | `--plot_zero_one_ADU_individual` | off | Plot the fits in ADU, one figure per extension. |
@@ -112,7 +113,7 @@ python -m pedestal_subtract --help
 | `--plot_zero_one_yscale` | `linear` | `linear` or `log`. |
 | `-s` / `--save_output` | off | Save plots to `--output_dir` **and** write a per-extension `extension_summary.csv` (columns `ext`, `pedestal_raw_adu`, `gain_adu_per_e`, `noise_adu`, `noise_e`, `exposure_days`, and the chosen dark-current column(s)) into the run's output folder. `pedestal_raw_adu` is the median pedestal location of the **raw** data, before pedestal subtraction. `noise_adu` is the shared peak width (σ) in ADU; `noise_e` is that width divided by the gain. For an extension with no one-electron peak, `gain_adu_per_e` and `noise_e` are `nan`, but `noise_adu` is still reported (it does not depend on the gain). |
 | `--do_dark_current` | on | Compute the per-extension dark current. Use `--no-do_dark_current` (or `"do_dark_current": false` in the config) to skip the dark-current calculation and its plot entirely; `extension_summary.csv` then omits the dark-current column(s). |
-| `--dark_current_method` | `weighted` | How to count single-electron events for the **dark current** (electrons / physical pixel / day = single-electron events ÷ physical pixels ÷ exposure-days, where physical pixels = image pixels × NPBIN × NSBIN, since the detector is read out binned and each image pixel sums NPBIN×NSBIN physical pixels). `count` counts pixels within `dark_current_count_nsigma` peak widths σ of the 1 e⁻ charge, then divides by the Gaussian fraction `erf(nsigma ⁄ √2)` (0.6827 at ±1σ) to estimate the **full** one-electron count, bringing it into agreement with the other two methods (the single shared σ, the pedestal width, is well-determined even at low statistics; the zero-peak tail is **not** subtracted, since those pixels can't be physically distinguished from real 1 e⁻ events). `integrate` uses the analytic area under the fitted one-electron Gaussian, `N₁·σ·√(2π) ⁄ bin-width` (a conservative upper bound, sensitive to the fit). `weighted` uses the one-electron amplitude fraction `n_events = N₁ ⁄ (N₁ + N₀)`, which is already per image pixel; its rate is therefore `N₁ ⁄ (N₁ + N₀) ⁄ (NPBIN·NSBIN) ⁄ exposure-days` — divided only by the pixel binning and exposure, **not** by the pixel count (which cancels in the ratio). `all` computes each and writes a column per method (`dark_current_count_e_per_pix_day`, `dark_current_integrate_e_per_pix_day`, `dark_current_weighted_e_per_pix_day`) so they can be compared. A `null` config value (or omitting the key) selects the default method, `weighted`. The exposure time is `DATEEND − DATEINI` from the FITS header (or `--exposure_time_s` when set) — unchanged for a stitched image, since each pixel was exposed for one image's duration. When the gain is undefined or the exposure can't be read, the dark current is `nan`. |
+| `--dark_current_method` | `weighted` | How to count single-electron events for the **dark current** (electrons / physical pixel / day = single-electron events ÷ physical pixels ÷ exposure-days, where physical pixels = image pixels × NPBIN × NSBIN, since the detector is read out binned and each image pixel sums NPBIN×NSBIN physical pixels; for **serial-register** images the binning factor is NSBIN alone — see below). `count` counts pixels within `dark_current_count_nsigma` peak widths σ of the 1 e⁻ charge, then divides by the Gaussian fraction `erf(nsigma ⁄ √2)` (0.6827 at ±1σ) to estimate the **full** one-electron count, bringing it into agreement with the other two methods (the single shared σ, the pedestal width, is well-determined even at low statistics; the zero-peak tail is **not** subtracted, since those pixels can't be physically distinguished from real 1 e⁻ events). `integrate` uses the analytic area under the fitted one-electron Gaussian, `N₁·σ·√(2π) ⁄ bin-width` (a conservative upper bound, sensitive to the fit). `weighted` uses the one-electron amplitude fraction `n_events = N₁ ⁄ (N₁ + N₀)`, which is already per image pixel; its rate is therefore `N₁ ⁄ (N₁ + N₀) ⁄ (NPBIN·NSBIN) ⁄ exposure-days` (NSBIN alone for serial-register images) — divided only by the pixel binning and exposure, **not** by the pixel count (which cancels in the ratio). `all` computes each and writes a column per method (`dark_current_count_e_per_pix_day`, `dark_current_integrate_e_per_pix_day`, `dark_current_weighted_e_per_pix_day`) so they can be compared. Every method also gets a per-**image** column (`dark_current_*_e_per_pix_image`) — the same quantity without the ÷ exposure-days step — for **all** images; **serial-register** images (`VTRANSF = 'Vtransfer11'`) get *only* the per-image column, since an exposure-normalised rate is not meaningful when a single CCD row is read out (see below). The `weighted` method additionally writes both of its rates per **binned** (image) pixel — `dark_current_weighted_e_per_binned_pix_day` and `dark_current_weighted_e_per_binned_pix_image` — the same numbers with **no** division by the pixel binning at all, i.e. per image pixel as read out rather than per physical CCD pixel (so per-binned-pixel = per-physical-pixel × NPBIN·NSBIN, or × NSBIN for serial-register images). A `null` config value (or omitting the key) selects the default method, `weighted`. The exposure time is `DATEEND − DATEINI` from the FITS header (or `--exposure_time_s` when set) — unchanged for a stitched image, since each pixel was exposed for one image's duration. When the gain is undefined the dark current is `nan`; when the exposure can't be read only the per-day rate is `nan` (the per-image rate doesn't use it). |
 | `--dark_current_count_center` | `one_electron` | For the `count` method, where the window is centred: `one_electron` (default) on the ideal 1 e⁻ charge (`pedestal + gain`), or `mu1` on the fitted one-electron peak mean μ₁. |
 | `--dark_current_count_nsigma` | `1.0` | Half-width of the `count` window in units of the fitted peak width σ (default `1.0` = ±1σ). The single shared σ (the pedestal width) stays well-determined at low statistics. Use `< 1` to shrink the window and cut the zero-peak tail contamination that dominates the count at low dark current. The rate itself does **not** depend on how many rows/columns are analysed (event count and pixel count scale together), so the charge-window width — not the spatial extent — is the knob for tail contamination. |
 | `--exposure_time_s` | from header | Manually set the exposure time in **seconds**, overriding the FITS-header `DATEEND − DATEINI`. Use when a file's header is missing `DATEINI`/`DATEEND` (so the dark current would otherwise be `nan`). Converted to days internally. In the JSON config use `null` to read from the header (the default). |
@@ -147,21 +148,27 @@ a handful of single-electron hits:
   The one-electron mean is bounded below by ~4 zero-peak widths off the pedestal
   (so it cannot slide down onto the bright shoulder), and that guard is capped at
   ~one width below the detected bump (so a **wide** zero peak — where 4 widths
-  exceed the actual gain — cannot exclude the genuine peak from the fit). The
+  exceed the actual gain — cannot exclude the genuine peak from the fit) and at
+  the minimum gain `_MIN_GAIN_ADU` (so a real peak between 0.5 ADU and 4 widths
+  is not excluded either). The
   bump is seeded from the largest excess above the estimated zero-peak tail,
   searched only past the shoulder; the zero-peak width itself is capped by the
   robust MAD sigma of the windowed data so coarse binning cannot inflate it. (A
   stricter "localized excess, not a tail" post-fit check,
   `_one_electron_peak_is_real`, exists but is currently disabled.)
 - **N₁ is tied to the measured bump height.** The one-electron amplitude is
-  bounded to the largest fit-histogram count in the allowed μ₁ band — after
+  bounded to the largest fit-histogram count ≥ 5σ right of μ₀ — after
   subtracting the zero Gaussian's estimated contribution per bin — within an
   asymmetric Poisson band: at most 1√count below but up to 2√count above the
   measured height (the `1/√counts` weighting systematically biases a sparse
   peak's amplitude low, so the tight side is below). The fit therefore cannot
   deflate N₁ while the zero Gaussian soaks up the bump; an empty band leaves
   the lower bound at 0, so a genuinely absent peak is still reported as "no
-  peak".
+  peak". Caveat: a real one-electron peak closer than 5σ (e.g. the 0.55 ADU
+  first-electron peak in the 09-24-2026 UChicago EXT 3, σ ≈ 0.21) gets N₁ from
+  the valley beyond it, so μ₁ lands on its upper flank. Starting the region
+  closer (at μ₀ + 0.5 ADU or μ₀ + 3σ) fixes that case but pulls LBC fits
+  (σ ≈ 0.28) onto the zero-peak shoulder, so it was not adopted.
 
 When no genuine peak is found, the gain is reported as undefined (`NaN`), the
 console prints `no 1 e- peak found`, and the plot shows only the single
@@ -185,6 +192,32 @@ columns, i.e. the slice `(-n, None)`. The required keys are `PRESCAN`, `PHYSCOL`
 key is missing, the pipeline falls back to the `--overscan_cols` flag / `overscan_cols`
 config value. The helpers `get_fits_header` and `overscan_cols_from_header` are also
 exported for library use.
+
+### Serial-register images (`VTRANSF`)
+
+Serial-register images use a different readout sequence from regular images: only the
+bottom-most CCD row — the serial register — is read out, so the vertical transfer never
+sums `NPBIN` rows and only pixels in that last row contribute to the image. The dark
+current must therefore be divided by the *serial* binning `NSBIN` alone, not by
+`NPBIN`×`NSBIN`.
+
+For the same reason, a serial-register image's dark current is **not** normalised by the
+exposure time: only one CCD row is read out, so an `e⁻/pix/day` rate is not meaningful.
+These images are quoted **per image** instead — `extension_summary.csv` carries only the
+`dark_current_*_e_per_pix_image` column(s) (plus `dark_current_weighted_e_per_binned_pix_image`)
+and the `..._per_pix_day` column(s) are omitted. The dark-current plot legends follow
+suit: instead of the single `e⁻/pix/day` rate a regular image shows, each method reports
+every per-image rate it has on its own line — `e⁻/binned pix/image` (`weighted` only)
+above `e⁻/pix/image`. Regular images get both:
+`e⁻/pix/image` is the same quantity as `e⁻/pix/day` before dividing by the exposure in
+days, so `e⁻/pix/day = e⁻/pix/image ⁄ exposure-days`.
+
+The readout type is read from the `VTRANSF` header key (scanning every HDU, matched
+case-insensitively): regular images carry `VTRANSF = 'Vtransfer22'`, serial-register
+images carry `VTRANSF = 'Vtransfer11'`. `is_serial_register_image(file)` returns `True`
+only for the latter; a missing key is treated as a regular image. With `--verbose` the
+pipeline prints which binning factor it used and, for a serial-register image, that the
+dark current is quoted per image.
 
 ## Config compatibility with `nonlinearity_studies`
 
@@ -257,8 +290,31 @@ data_ext = pedestal_subtract_ext_cached(data_ext, source_path="image.fits",
 #                                         n_std_to_mask=1.5, axis="row",
 #                                         overscan_cols=[(-147, None), None, (-147, None), None])
 (counts, edges, pedestals, gains,
- popts, ranges) = get_zero_one_peaks_ext(data_ext, n=100)
+ popts, ranges) = get_zero_one_peaks_ext(data_ext, n_bins=100)
 ```
+
+## Dark current from a Poisson ⊗ Gaussian fit
+
+`pedestal_subtract.poisson_fit.analyze_image(image_path)` takes a glob (an already
+stitched FITS, or per-image files that are stitched first), pedestal-subtracts with the
+package, and fits each extension's zero/one-electron histogram with one Gaussian (shared
+read noise σ) convolved with Poisson(λ): peak *k* sits at `m0 + k·gain` with weight
+Pois(*k*; λ). The fit is a binned Poisson likelihood over free (λ, σ, m0, gain), seeded
+from (and windowed like) the double-Gaussian fit, with the same left-tail cut. λ is the
+dark current in e⁻/image-pixel/image; use the returned `exposure_days` and
+`pixel_binning` to convert to per-physical-pixel/day. Pedestal-subtraction and histogram
+options come from the config JSON (default `config/pedestal_subtract_LBC.json`) and can
+be overridden by keyword. Returns one dict per extension (`lam`, `lam_err`, `sigma_adu`,
+`noise_e`, `gain`, `counts`, `edges`, ...).
+
+With `by_row=True`, `analyze_image` also fits each image row: for every row index the
+pixels from that row of **all** stitched images (rows per image = total rows ÷ the
+`STITCHED` header count) are pooled, σ, m0 and gain are held fixed at the whole-image
+fit (a row holds only ~10 one-electron events), and only λ is fit. Each extension dict
+gains `row_fits` (`row`, `t_eff_s`, `lam`, `lam_err`, `n_pix`), `exposure_s` (header
+`EXPOSURE`) and `n_rows`, with effective exposure
+`t_eff_s = EXPOSURE + row·(DATEEND − DATEINI − EXPOSURE)/n_rows` (0-based row). A row
+with no events pins λ at its lower bound and has a `nan` error.
 
 ## Requirements
 

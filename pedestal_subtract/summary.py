@@ -4,7 +4,9 @@ summary — split out of core.py.
 import csv
 from pathlib import Path
 
-from .constants import _DARK_CURRENT_COLUMN, _DARK_CURRENT_METHODS
+from .constants import (_DARK_CURRENT_BINNED_COLUMN, _DARK_CURRENT_BINNED_IMAGE_COLUMN,
+                        _DARK_CURRENT_COLUMN, _DARK_CURRENT_IMAGE_COLUMN,
+                        _DARK_CURRENT_METHODS)
 
 def build_extension_summary(gains, double_gauss_popts, dark_current_rows=None,
                             exposure_days=None, raw_pedestals=None):
@@ -18,7 +20,8 @@ def build_extension_summary(gains, double_gauss_popts, dark_current_rows=None,
     When supplied, optional columns are merged in: ``raw_pedestals`` adds
     ``pedestal_raw_adu`` (the pre-subtraction baseline, see ``raw_pedestal_locations``),
     ``exposure_days`` adds an ``exposure_days`` column, and ``dark_current_rows`` (from
-    ``calculate_dark_current``) adds the chosen dark-current column(s).
+    ``calculate_dark_current``) adds the chosen dark-current column(s) -- per image, and
+    per day unless they were computed per image only (serial-register images).
     """
     rows = []
     for ext, gain in enumerate(gains):
@@ -48,10 +51,15 @@ def _extension_summary_fieldnames(dark_current_rows=None, exposure_days=None,
     if exposure_days is not None:
         fieldnames.append('exposure_days')
     if dark_current_rows:
+        # Per method, the per-day column (absent for serial-register images) then the
+        # per-image column, then the same pair per *binned* pixel ('weighted' only);
+        # only those actually computed are written.
         for method in _DARK_CURRENT_METHODS:
-            column = _DARK_CURRENT_COLUMN[method]
-            if any(column in row for row in dark_current_rows):
-                fieldnames.append(column)
+            for columns in (_DARK_CURRENT_COLUMN, _DARK_CURRENT_IMAGE_COLUMN,
+                            _DARK_CURRENT_BINNED_COLUMN, _DARK_CURRENT_BINNED_IMAGE_COLUMN):
+                column = columns.get(method)
+                if column and any(column in row for row in dark_current_rows):
+                    fieldnames.append(column)
     return fieldnames
 
 
